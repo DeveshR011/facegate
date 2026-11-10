@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from facegate.config import Settings  # noqa: E402
-from facegate.core.engine import FaceEngine  # noqa: E402
+from facegate.core.engine import create_engine  # noqa: E402
 from facegate.core.occlusion import VIEWS, synth_cap, synth_mask  # noqa: E402
 
 LFW_URL = "https://ndownloader.figshare.com/files/5976015"   # lfw-funneled.tgz
@@ -78,7 +78,7 @@ def select_images(root: Path, max_per_id: int, singletons: int) -> tuple[list[Pa
     return paths, np.array(labels)
 
 
-def embed_all(paths: list[Path], engine: FaceEngine) -> tuple[dict, np.ndarray]:
+def embed_all(paths: list[Path], engine) -> tuple[dict, np.ndarray]:
     rng = np.random.default_rng(7)
     feats = {c: {v: [] for v in VIEWS} for c in CONDITIONS}
     keep = []
@@ -122,15 +122,16 @@ def main() -> int:
 
     root = fetch_lfw()
     paths, labels = select_images(root, args.max_per_id, args.singletons)
-    cache = CACHE / f"lfw_emb_v2_{args.max_per_id}_{args.singletons}.npz"
+    engine = create_engine()
+    kind = type(engine).__name__
+    cache = CACHE / f"lfw_emb_v3_{kind}_{args.max_per_id}_{args.singletons}.npz"
 
     if cache.exists() and not args.no_cache:
         z = np.load(cache)
         feats = {c: {v: z[f"{c}_{v}"] for v in VIEWS} for c in CONDITIONS}
         labels = z["labels"]
     else:
-        engine = FaceEngine()
-        print(f"embedding {len(paths)} images on {engine.provider}…", flush=True)
+        print(f"embedding {len(paths)} images with {kind} on {engine.provider}…", flush=True)
         feats, keep = embed_all(paths, engine)
         labels = labels[keep]
         np.savez(cache, labels=labels,
@@ -183,6 +184,37 @@ def main() -> int:
     strict = Settings()
     strict.occlusion_unlock = False
     report(strict, "With 'Unlock with a mask' switched off")
+
+    # ---- calibration: the best thresholds for a stated false-accept budget -------------------
+    # Only impostor pairs whose whole-face score reaches the floor can ever be accepted by a rule
+    # with that floor, so the search runs over that small subset (a few hundred thousand pairs).
+    floor_min = 0.20
+    full_imp = S[("clean", "full")][clean_imp]
+    sub = full_imp >= floor_min
+    imp_full, imp_mask = full_imp[sub], S[("clean", "mask")][clean_imp][sub]
+    g_full, g_mask = S[("masked", "full")][genuine], S[("masked", "mask")][genuine]
+    total = int(clean_imp.sum())
+    print(f"\nCalibration (adjusted impostor pairs: {total:,}; mask unlock off = whole-face threshold only)")
+    for far in (1e-5, 1e-6):
+        t = far_threshold(full_imp, far)
+        best = (0.0, None)
+        for match in np.arange(max(floor_min, t - 0.14), t + 1e-6, 0.01):
+            if (imp_full >= match).sum() / total > far:
+                continue
+            for floor in np.arange(floor_min, match, 0.01):
+                for mask in np.arange(0.20, 0.70, 0.01):
+                    if ((imp_full >= match) | ((imp_full >= floor) & (imp_mask >= mask))).sum() / total > far:
+                        continue
+                    tar = ((g_full >= match) | ((g_full >= floor) & (g_mask >= mask))).mean()
+                    if tar > best[0]:
+                        best = (tar, (float(match), float(floor), float(mask)))
+        clean_tar = 100 * (S[("clean", "full")][genuine] >= t).mean()
+        masked_tar = 100 * (g_full >= t).mean()
+        print(f"  FAR {far:.0e}: whole-face threshold {t:.3f} -> clean {clean_tar:.2f}%, masked {masked_tar:.2f}%")
+        if best[1]:
+            m, f, k = best[1]
+            print(f"             with mask unlock: match_threshold={m:.2f} occlusion_floor={f:.2f} "
+                  f"mask_threshold={k:.2f} -> masked {100 * best[0]:.2f}%")
     return 0
 
 

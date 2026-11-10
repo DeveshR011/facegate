@@ -28,6 +28,17 @@ jobs:
           cmake --build credential_provider/build --config Release
       - name: Credential provider harness
         run: ctest --test-dir credential_provider/build -C Release --output-on-failure
+      - name: Build C++ engine
+        # Fetches the signed ONNX Runtime / DirectML packages and verifies their signatures.
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File engine/build.ps1
+      - name: Packaging scripts parse
+        shell: powershell
+        run: |
+          foreach ($f in "packaging/Install-FaceGate.ps1", "tools/build_exe.ps1", "engine/build.ps1", "engine/fetch_deps.ps1") {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs)
+            if ($errs.Count) { $errs | ForEach-Object { Write-Error "$f : $($_.Message)" }; exit 1 }
+          }
 
   container:
     name: Container image builds and imports

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDia
 from .. import APP_NAME, __version__
 from ..config import ProtectedApp, data_dir
 from ..guard.policy import can_protect
+from .appearance import AppearanceCard
 from .context import AppContext
 from .enroll import EnrollDialog
 from .glyph import FaceGlyph
@@ -128,7 +129,8 @@ class MainWindow(QWidget):
 
         # ---- header ----
         head = QHBoxLayout(); head.setSpacing(16)
-        head.addWidget(FaceGlyph(58))
+        self.header_glyph = FaceGlyph(58)
+        head.addWidget(self.header_glyph)
         titles = QVBoxLayout(); titles.setSpacing(2)
         title = QLabel(APP_NAME); title.setObjectName("title")
         self.summary = QLabel(""); self.summary.setObjectName("secondary")
@@ -170,6 +172,14 @@ class MainWindow(QWidget):
                                      "Learns gradual changes - beard, glasses, hairstyle - from "
                                      "confident matches.", "adaptive_learning", protect_off=False)
         root.addWidget(frame)
+
+        # ---- appearance ----
+        root.addWidget(section_label("Appearance"))
+        frame, lay = card()
+        self.appearance = AppearanceCard(ctx)
+        lay.addWidget(self.appearance)
+        root.addWidget(frame)
+        root.addWidget(footnote("Colours of the unlock animation: while scanning, on success and on failure."))
 
         # ---- protected apps ----
         root.addWidget(section_label("App Lock"))
@@ -283,6 +293,8 @@ class MainWindow(QWidget):
                          (self.sw_adapt, "adaptive_learning"), (self.sw_guard, "guard_enabled")):
             sw.setChecked(getattr(s, attr), animate=False)
 
+        self.appearance.sync()
+        self.header_glyph.set_palette(self.appearance.current())
         self._rebuild_apps()
         self._refresh_windows()
 
@@ -408,34 +420,48 @@ class MainWindow(QWidget):
 
     # ---- windows actions -------------------------------------------------
 
-    def _restart_elevated(self) -> None:
-        from ..win.system import run_elevated
+    NOT_INSTALLED_TEXT = ("For safety, FaceGate only runs elevated from a folder that ordinary programs "
+                          "cannot modify.\n\nInstall it to Program Files with Install-FaceGate.ps1 "
+                          "(included next to FaceGate.exe), start that copy, and try again.")
 
+    def _restart_elevated(self) -> None:
+        from ..win.system import app_command, elevation_safe, run_elevated
+
+        if not elevation_safe():
+            QMessageBox.information(self, APP_NAME, self.NOT_INSTALLED_TEXT)
+            return
         # The elevated copy waits for this one to exit, then takes over. If the
         # UAC prompt is declined nothing was started and we simply keep running.
-        if run_elevated(["-m", "facegate", "--takeover"], wait=False) is not None:
+        exe, args = app_command(["--takeover"])
+        if run_elevated(args, wait=False, exe=exe) is not None:
             QApplication.instance().quit()
 
     def _run_admin(self, action: str) -> int | None:
         from ..win import admin
-        from ..win.system import current_account, current_sid, is_admin, run_elevated
+        from ..win.system import app_command, current_account, current_sid, is_admin, run_elevated
 
         domain, user = current_account()
         args = [action, "--user", f"{domain}\\{user}", "--sid", current_sid()]
         if is_admin():
             return admin.main(args)
-        return run_elevated(["-m", "facegate", "admin", *args], wait=True)
+        exe, argv = app_command(["admin", *args])
+        return run_elevated(argv, wait=True, exe=exe)
 
     def _toggle_autostart(self, value: bool) -> None:
+        from ..win.admin import EXIT_NOT_INSTALLED
+
         code = self._run_admin("autostart-on" if value else "autostart-off")
-        if code != 0:
+        if code == EXIT_NOT_INSTALLED:
+            QMessageBox.information(self, APP_NAME, self.NOT_INSTALLED_TEXT)
+        elif code != 0:
             QMessageBox.warning(self, APP_NAME, "The change was not applied."
                                 if code is None else f"The change failed (code {code}).")
         self._refresh_windows()
 
     def _toggle_unlock(self, value: bool) -> None:
         from ..win import admin
-        from ..win.system import (current_account, current_sid, is_admin, store_unlock_secret)
+        from ..win.system import (current_account, current_sid, delete_unlock_secret, elevation_safe,
+                                  is_admin, store_unlock_secret)
 
         if not value:
             if self._confirm():
@@ -451,6 +477,8 @@ class MainWindow(QWidget):
         elif admin.built_provider_dll() is None:
             problem = ("The lock-screen component has not been built yet.\n\n"
                        "Run credential_provider\\build.ps1, then try again.")
+        elif not elevation_safe():
+            problem = self.NOT_INSTALLED_TEXT                 # checked before any password is requested
         elif not is_admin():
             problem = ("Storing your Windows password requires administrator rights.\n\n"
                        "Click “Restart as Administrator” above, then turn this on again.")
@@ -473,6 +501,7 @@ class MainWindow(QWidget):
         self.ctx.save()
         code = self._run_admin("unlock-install")
         if code != 0:
+            delete_unlock_secret()                            # never leave the stored password behind
             self.ctx.settings.windows_unlock = False
             self.ctx.save()
             QMessageBox.warning(self, APP_NAME, f"Installing the lock-screen component failed (code {code}).")

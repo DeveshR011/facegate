@@ -23,11 +23,11 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from ..config import data_dir
-from .system import delete_unlock_secret, is_admin, python_gui_exe
+from .system import app_command, delete_unlock_secret, elevation_safe, is_admin, is_compiled
 
 log = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]      # repo root, or the unpacked Nuitka bundle
 TASK_APP = r"FaceGate\App"
 TASK_SERVICE = r"FaceGate\UnlockService"
 
@@ -38,11 +38,22 @@ _CP_KEY = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential
 _CLSID_KEY = rf"SOFTWARE\Classes\CLSID\{PROVIDER_CLSID}"
 _APP_KEY = r"SOFTWARE\FaceGate"
 
-EXIT_OK, EXIT_FAILED, EXIT_NOT_ADMIN, EXIT_NOT_BUILT = 0, 1, 2, 3
+EXIT_OK, EXIT_FAILED, EXIT_NOT_ADMIN, EXIT_NOT_BUILT, EXIT_NOT_INSTALLED = 0, 1, 2, 3, 4
+
+
+def _unsafe_for_elevation(exe: str) -> bool:
+    """A compiled FaceGate that runs elevated must live where only administrators can write."""
+    if not elevation_safe():
+        print(f"Refusing to register an elevated task for {exe}: it, or the folder its code is "
+              "unpacked to, is writable by ordinary programs. Install the folder build to "
+              "Program Files first (Install-FaceGate.ps1).")
+        return True
+    return False
 
 
 def built_provider_dll() -> Path | None:
     for candidate in (
+        PROJECT_ROOT / "native" / PROVIDER_DLL,                  # bundled in the exe
         PROJECT_ROOT / "credential_provider" / "build" / "Release" / PROVIDER_DLL,
         PROJECT_ROOT / "credential_provider" / "build" / PROVIDER_DLL,
     ):
@@ -57,8 +68,10 @@ def installed_provider_dll() -> Path:
 
 # ---- scheduled tasks -----------------------------------------------------
 
-def _task_xml(description: str, trigger: str, principal: str, arguments: str,
+def _task_xml(description: str, trigger: str, principal: str, command: tuple[str, list[str]],
               restart: bool) -> str:
+    exe, args = command
+    workdir = str(Path(exe).parent) if is_compiled() else str(PROJECT_ROOT)
     restart_xml = (
         "<RestartOnFailure><Interval>PT1M</Interval><Count>5</Count></RestartOnFailure>"
         if restart else ""
@@ -80,9 +93,9 @@ def _task_xml(description: str, trigger: str, principal: str, arguments: str,
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>{escape(python_gui_exe())}</Command>
-      <Arguments>{escape(arguments)}</Arguments>
-      <WorkingDirectory>{escape(str(PROJECT_ROOT))}</WorkingDirectory>
+      <Command>{escape(exe)}</Command>
+      <Arguments>{escape(subprocess.list2cmdline(args))}</Arguments>
+      <WorkingDirectory>{escape(workdir)}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
@@ -110,12 +123,16 @@ def task_exists(name: str) -> bool:
     return _schtasks("/Query", "/TN", name).returncode == 0
 
 
-def autostart_on(user: str) -> None:
+def autostart_on(user: str) -> int:
+    command = app_command(["--tray"])
+    if _unsafe_for_elevation(command[0]):
+        return EXIT_NOT_INSTALLED
     trigger = f"<LogonTrigger><Enabled>true</Enabled><UserId>{escape(user)}</UserId></LogonTrigger>"
     principal = (f"<UserId>{escape(user)}</UserId><LogonType>InteractiveToken</LogonType>"
                  "<RunLevel>HighestAvailable</RunLevel>")
     _create_task(TASK_APP, _task_xml("FaceGate app lock (starts in the tray)", trigger, principal,
-                                     "-m facegate --tray", restart=False))
+                                     command, restart=False))
+    return EXIT_OK
 
 
 def autostart_off() -> None:
@@ -157,6 +174,9 @@ def unlock_install(user: str, sid: str) -> int:
     if src is None:
         print("The credential provider has not been built. Run credential_provider\\build.ps1 first.")
         return EXIT_NOT_BUILT
+    command = app_command(["service"])
+    if _unsafe_for_elevation(command[0]):
+        return EXIT_NOT_INSTALLED
     dst = installed_provider_dll()
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
@@ -171,7 +191,7 @@ def unlock_install(user: str, sid: str) -> int:
     trigger = "<BootTrigger><Enabled>true</Enabled></BootTrigger>"
     principal = "<UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel>"
     _create_task(TASK_SERVICE, _task_xml("FaceGate lock-screen recognition service", trigger,
-                                         principal, "-m facegate service", restart=True))
+                                         principal, command, restart=True))
     _schtasks("/Run", "/TN", TASK_SERVICE)
     return EXIT_OK
 
@@ -210,7 +230,7 @@ def main(argv: list[str]) -> int:
         return EXIT_NOT_ADMIN
     try:
         if args.action == "autostart-on":
-            autostart_on(args.user)
+            return autostart_on(args.user)
         elif args.action == "autostart-off":
             autostart_off()
         elif args.action == "unlock-install":

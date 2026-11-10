@@ -18,6 +18,8 @@ from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, QSize, Qt, QTimer, Si
 from PySide6.QtGui import QColor, QConicalGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
+from .palette import DEFAULT, PALETTES, Palette
+
 WHITE = QColor(255, 255, 255)
 GREEN = QColor(48, 209, 88)
 RED = QColor(255, 69, 58)
@@ -41,9 +43,10 @@ class GlyphFrame:
     check: float = 0.0        # how much of the tick is drawn
     scale: float = 1.0
     shake: float = 0.0        # horizontal offset, in glyph widths
-    tint: float = 0.0         # 0 = white, 1 = accent colour
+    tint: float = 0.0         # 0 = scan colour, 1 = accent colour
     accent: QColor = field(default_factory=lambda: QColor(GREEN))
     sweep: float = -1.0       # angle (deg) of the travelling highlight, <0 = off
+    colors: tuple = field(default_factory=lambda: (QColor(WHITE),))   # scan colours; >1 = gradient
 
 
 def _clamp(x: float) -> float:
@@ -65,13 +68,16 @@ def _ease_out_back(x: float) -> float:
     return 1 + c3 * (x - 1) ** 3 + c1 * (x - 1) ** 2
 
 
-def frame_at(state: GlyphState, t: float) -> GlyphFrame:
+def frame_at(state: GlyphState, t: float, palette: Palette | None = None) -> GlyphFrame:
+    p = palette or PALETTES[DEFAULT]
+    colors = p.scan_colors()
+
     if state is GlyphState.IDLE:
-        return GlyphFrame()
+        return GlyphFrame(colors=colors)
 
     if state is GlyphState.SCANNING:
         breathe = 1.0 + 0.022 * math.sin(t * 2 * math.pi / 1.6)
-        return GlyphFrame(scale=breathe, sweep=(t * 240.0) % 360.0,
+        return GlyphFrame(scale=breathe, sweep=(t * 240.0) % 360.0, colors=colors,
                           face=0.82 + 0.18 * math.sin(t * 2 * math.pi / 1.6))
 
     if state is GlyphState.SUCCESS:
@@ -83,14 +89,15 @@ def frame_at(state: GlyphState, t: float) -> GlyphFrame:
             check=_ease_out((t - 0.26) / 0.30),
             scale=(1.0 - 0.07 * morph) + 0.07 * pop,
             tint=_ease_in_out(t / 0.32),
-            accent=GREEN,
+            accent=p.success_color(),
+            colors=colors,
         )
 
     # FAILURE
     decay = math.exp(-5.5 * t)
     flash = math.sin(math.pi * _clamp(t / FAILURE_DURATION))
     return GlyphFrame(shake=0.075 * math.sin(2 * math.pi * 6.5 * t) * decay,
-                      tint=flash, accent=RED)
+                      tint=flash, accent=p.failure_color(), colors=colors)
 
 
 def _mix(a: QColor, b: QColor, k: float) -> QColor:
@@ -152,7 +159,8 @@ def _check_path(progress: float) -> QPainterPath:
     return p
 
 
-def paint_glyph(painter: QPainter, rect: QRectF, f: GlyphFrame, base: QColor = WHITE) -> None:
+def paint_glyph(painter: QPainter, rect: QRectF, f: GlyphFrame) -> None:
+    base = f.colors[0] if f.colors else WHITE
     side = min(rect.width(), rect.height())
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -165,12 +173,18 @@ def paint_glyph(painter: QPainter, rect: QRectF, f: GlyphFrame, base: QColor = W
 
     # --- brackets / ring ---
     if f.sweep >= 0:
-        dim = QColor(colour); dim.setAlphaF(0.42)
         grad = QConicalGradient(QPointF(0, 0), -f.sweep)
-        grad.setColorAt(0.00, colour)
-        grad.setColorAt(0.16, dim)
-        grad.setColorAt(0.84, dim)
-        grad.setColorAt(1.00, colour)
+        if len(f.colors) > 1:                      # colours flow round the brackets
+            n = len(f.colors)
+            for i, c in enumerate(f.colors):
+                grad.setColorAt(i / n, c)
+            grad.setColorAt(1.0, f.colors[0])      # closes the loop seamlessly
+        else:                                      # one colour: a bright comet on a dim track
+            dim = QColor(colour); dim.setAlphaF(0.42)
+            grad.setColorAt(0.00, colour)
+            grad.setColorAt(0.16, dim)
+            grad.setColorAt(0.84, dim)
+            grad.setColorAt(1.00, colour)
         pen.setBrush(grad)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -205,6 +219,7 @@ class FaceGlyph(QWidget):
         super().__init__(parent)
         self._size = size
         self._state = GlyphState.IDLE
+        self._palette = PALETTES[DEFAULT]
         self._clock = QElapsedTimer()
         self._clock.start()
         self._notified = True
@@ -222,6 +237,10 @@ class FaceGlyph(QWidget):
     @property
     def state(self) -> GlyphState:
         return self._state
+
+    def set_palette(self, palette: Palette) -> None:
+        self._palette = palette
+        self.update()
 
     def set_state(self, state: GlyphState) -> None:
         if state is self._state and state is GlyphState.SCANNING:
@@ -250,5 +269,5 @@ class FaceGlyph(QWidget):
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         t = self._clock.elapsed() / 1000.0
-        paint_glyph(painter, QRectF(self.rect()), frame_at(self._state, t))
+        paint_glyph(painter, QRectF(self.rect()), frame_at(self._state, t, self._palette))
         painter.end()

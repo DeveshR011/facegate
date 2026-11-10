@@ -1,0 +1,7 @@
+# Extra tools for building the C++ engine's models and the Nuitka exe (see tools/build_exe.ps1).
+-r requirements.txt
+nuitka>=2.5
+ordered-set>=4.1
+zstandard>=0.22
+onnx>=1.16
+onnxconverter-common>=1.14

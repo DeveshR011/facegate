@@ -14,11 +14,7 @@ SECRET_NAME = "L$FaceGateUnlock"        # "L$" = local secret, readable by SYSTE
 
 # ---- elevation -----------------------------------------------------------
 
-def is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except OSError:
-        return False
+from ..config import is_elevated as is_admin  # noqa: E402,F401  (one definition of "am I elevated")
 
 
 def python_gui_exe() -> str:
@@ -26,6 +22,47 @@ def python_gui_exe() -> str:
     exe = Path(sys.executable)
     w = exe.with_name("pythonw.exe")
     return str(w if w.exists() else exe)
+
+
+def is_compiled() -> bool:
+    """True inside the Nuitka-built FaceGate.exe (the global exists only in compiled modules)."""
+    return "__compiled__" in globals()
+
+
+def current_exe() -> str:
+    """Path of the exe the user started. Not sys.executable: in a onefile build that is an
+    extracted temporary copy; the loader reports the original file."""
+    buf = ctypes.create_unicode_buffer(1024)
+    ctypes.windll.kernel32.GetModuleFileNameW(None, buf, len(buf))
+    return buf.value or sys.argv[0]
+
+
+def app_command(args: list[str]) -> tuple[str, list[str]]:
+    """(executable, arguments) that start FaceGate with the given CLI arguments."""
+    if is_compiled():
+        return current_exe(), list(args)
+    return python_gui_exe(), ["-m", "facegate", *args]
+
+
+def elevation_safe() -> bool:
+    """May this copy of FaceGate run elevated (scheduled tasks, the SYSTEM service)?
+
+    From source the user owns the tree, as with any dev checkout. A compiled build must be both
+    started from, and have its code unpacked in, an administrator-only folder. A onefile exe
+    unpacks into a per-user cache, so only the installed folder build qualifies."""
+    if not is_compiled():
+        return True
+    return in_protected_location(current_exe()) and in_protected_location(__file__)
+
+
+def in_protected_location(path: str) -> bool:
+    """True when only administrators can modify `path` (Program Files or Windows).
+
+    A process that runs elevated must not load code from a folder an ordinary process can
+    write to; otherwise that process could plant a DLL and gain administrator rights."""
+    p = os.path.normcase(os.path.abspath(path))
+    roots = [os.environ.get(k) for k in ("ProgramFiles", "ProgramFiles(x86)", "SystemRoot")]
+    return any(r and p.startswith(os.path.normcase(os.path.abspath(r)) + os.sep) for r in roots)
 
 
 class _ShellExecuteInfo(ctypes.Structure):

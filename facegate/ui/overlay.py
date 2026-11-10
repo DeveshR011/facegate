@@ -17,6 +17,7 @@ from ..core.auth import AuthSession, AuthState
 from ..core.camera import Camera, CameraError
 from .context import AppContext
 from .glyph import FaceGlyph, GlyphState
+from .palette import palette_for
 from .theme import TEXT_2, ui_font
 
 
@@ -162,6 +163,8 @@ class AuthOverlay(QWidget):
         self.use_pw.setVisible(self._allow_password)
         self.title.setText(title)
         self.password.clear()
+        s = self.ctx.settings
+        self.glyph.set_palette(palette_for(s.theme, s.custom_color))
 
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
         self.setGeometry(screen.geometry())

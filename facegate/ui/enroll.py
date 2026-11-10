@@ -15,6 +15,7 @@ from ..core.auth import POSES, EnrollSession
 from ..core.camera import Camera, CameraError
 from .context import AppContext
 from .glyph import FaceGlyph, GlyphState
+from .palette import palette_for
 from .theme import GREEN, ui_font
 
 PREVIEW = 360          # px of the square frame sent to the UI
@@ -74,6 +75,7 @@ class CameraRing(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._image: QImage | None = None
+        self._color = QColor(GREEN)
         self._target = 0.0
         self._shown = 0.0
         self._timer = QTimer(self)
@@ -85,6 +87,10 @@ class CameraRing(QWidget):
 
     def set_image(self, image: QImage) -> None:
         self._image = image
+        self.update()
+
+    def set_color(self, color: QColor) -> None:
+        self._color = QColor(color)
         self.update()
 
     def set_progress(self, value: float) -> None:
@@ -123,7 +129,7 @@ class CameraRing(QWidget):
             angle = -math.pi / 2 + 2 * math.pi * i / self.TICKS
             k = max(0.0, min(1.0, lit - i))
             inner = outer - 10 - 6 * k
-            colour = QColor(GREEN) if k > 0 else QColor(84, 84, 88)
+            colour = QColor(self._color) if k > 0 else QColor(84, 84, 88)
             if 0 < k < 1:
                 colour.setAlphaF(0.4 + 0.6 * k)
             p.setPen(QPen(colour, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
@@ -201,6 +207,11 @@ class EnrollDialog(QDialog):
         self.end_button = QPushButton("Done"); self.end_button.setObjectName("primary")
         el.addWidget(self.end_button)
         self.stack.addWidget(end)
+
+        palette = palette_for(ctx.settings.theme, ctx.settings.custom_color)
+        for glyph in (g, self.end_glyph):
+            glyph.set_palette(palette)
+        self.ring.set_color(palette.success_color())
 
     def _begin(self) -> None:
         self.stack.setCurrentIndex(1)

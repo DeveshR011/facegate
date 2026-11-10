@@ -1,27 +1,34 @@
 """Command-line entry point.
 
-    python -m facegate                 settings window (+ tray, + app guard)
-    python -m facegate --tray          start hidden in the tray
-    python -m facegate verify          one recognition attempt in the terminal
-    python -m facegate serve           HTTP API (used by the Docker image)
-    python -m facegate service         lock-screen pipe service (runs as SYSTEM)
-    python -m facegate admin <action>  elevated maintenance actions
+    FaceGate.exe                       settings window (+ tray, + app guard)
+    FaceGate.exe --tray                start hidden in the tray
+    FaceGate.exe selftest [--image F] [--output F]
+                                       load the engine and run it once; no camera, no stored data
+    FaceGate.exe verify                one recognition attempt in the terminal
+    FaceGate.exe serve                 HTTP API (source install / Docker only)
+    FaceGate.exe service               lock-screen pipe service (runs as SYSTEM)
+    FaceGate.exe admin <action>        elevated maintenance actions
+    FaceGate.exe --version
+
+From source, replace FaceGate.exe with  python -m facegate.
 """
 
 from __future__ import annotations
 
 import sys
 
+from . import __version__
+
 
 def _verify() -> int:
     from .config import load_settings
     from .core.auth import AuthSession
     from .core.camera import Camera
-    from .core.engine import FaceEngine
+    from .core.engine import create_engine
     from .core.store import TemplateStore
 
     settings, store = load_settings(), TemplateStore()
-    engine = FaceEngine()
+    engine = create_engine()
     with Camera(settings.camera_index) as cam:
         cam.warm_up()
         session = AuthSession(engine, store, settings)
@@ -37,17 +44,84 @@ def _verify() -> int:
     return 0 if update.ok else 1
 
 
+def _selftest(argv: list[str]) -> int:
+    """Prove the engine, its runtime and its models work on this machine."""
+    import json
+    import time
+
+    import cv2
+    import numpy as np
+
+    from .core.engine import create_engine
+
+    def option(name: str) -> str | None:
+        return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else None
+
+    started = time.perf_counter()
+    engine = create_engine(allow_download=False)
+    report: dict = {
+        "version": __version__,
+        "engine": type(engine).__name__,
+        "provider": engine.provider,
+        "adapter": getattr(engine, "adapter", None),
+        "vram_mb": getattr(engine, "vram_mb", None),
+        "load_seconds": round(time.perf_counter() - started, 2),
+        "blank_frame_faces": len(engine.detect(np.zeros((480, 640, 3), dtype=np.uint8))),
+    }
+    image_path = option("--image")
+    if image_path:
+        image = cv2.imread(image_path)
+        if image is None:
+            report["error"] = f"cannot read {image_path}"
+        else:
+            faces = engine.detect(image)
+            report["faces"] = len(faces)
+            if faces:
+                crop = engine.align(image, faces[0])
+                views = engine.embed_views(crop)
+                report["embedding_norms"] = {v: round(float(np.linalg.norm(e)), 4) for v, e in views.items()}
+                report["liveness"] = round(engine.liveness(image, faces[0]), 3)
+    # Proves every bundled dependency is present (the point of the check inside a packaged build).
+    import importlib
+
+    deps = {}
+    for name in ("cv2", "numpy", "psutil", "win32api", "win32security", "win32pipe", "win32ts",
+                 "PySide6.QtWidgets", "PySide6.QtNetwork"):
+        try:
+            importlib.import_module(name)
+            deps[name] = True
+        except ImportError:
+            deps[name] = False
+    report["dependencies"] = deps
+    text = json.dumps(report, indent=2)
+    print(text)
+    if option("--output"):          # a windowed build has no console to print to
+        with open(option("--output"), "w", encoding="utf-8") as f:
+            f.write(text)
+    return 1 if "error" in report else 0
+
+
 def main() -> int:
     args = sys.argv[1:]
+    if args and args[0] in ("--version", "-V"):
+        print(f"FaceGate {__version__}")
+        return 0
     command = args[0] if args and not args[0].startswith("-") else "gui"
 
     if command == "gui":
         from .ui.app import run
         return run(args)
+    if command == "selftest":
+        return _selftest(args[1:])
     if command == "verify":
         return _verify()
     if command == "serve":
-        from .service.api import main as serve
+        try:
+            from .service.api import main as serve
+        except ImportError:
+            print("The HTTP API needs FastAPI, which is not part of the packaged app.\n"
+                  "Install from source (pip install -r requirements-server.txt) or use the Docker image.")
+            return 2
         return serve(args[1:])
     if command == "service":
         from .service.unlock import main as service

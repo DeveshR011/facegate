@@ -64,9 +64,9 @@ def user_has_session(local_user: str) -> bool:
 
 class UnlockService:
     def __init__(self) -> None:
-        from ..core.engine import FaceEngine
+        from ..core.engine import create_engine
 
-        self.engine = FaceEngine(allow_download=False)
+        self.engine = create_engine(allow_download=False)
         self.store = TemplateStore()
         s = load_settings()
         self.limiter = AttemptLimiter(data_dir() / "attempts_service.json",

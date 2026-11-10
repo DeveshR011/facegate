@@ -15,23 +15,14 @@ import numpy as np
 
 from .align import CROP, align_face
 from .detector import Face, FaceDetector
+from .imaging import enhance_low_light  # noqa: F401  (re-exported for existing callers)
+from .imaging import sharpness as image_sharpness
 from .models import ProgressFn, Session, ensure_models
 from .occlusion import VIEWS, view_of
 
 log = logging.getLogger(__name__)
 
 REC_BATCH = len(VIEWS) * 2      # each view plus its mirror image
-
-
-def enhance_low_light(frame_bgr: np.ndarray) -> np.ndarray:
-    """Gamma-lift dark frames so detection and recognition see a usable face."""
-    small = cv2.resize(frame_bgr, (64, 36), interpolation=cv2.INTER_AREA)
-    mean = float(small.mean())
-    if mean >= 80.0 or mean < 1.0:
-        return frame_bgr
-    gamma = float(np.clip(np.log(110.0 / 255.0) / np.log(mean / 255.0), 0.35, 1.0))
-    lut = (np.linspace(0, 1, 256) ** gamma * 255.0).astype(np.uint8)
-    return cv2.LUT(frame_bgr, lut)
 
 
 class FaceEngine:
@@ -122,18 +113,39 @@ class FaceEngine:
 
     @staticmethod
     def sharpness(crop_bgr: np.ndarray) -> float:
-        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        return image_sharpness(crop_bgr)
 
 
-_engine: FaceEngine | None = None
+def create_engine(progress: ProgressFn | None = None, prefer: str | None = None,
+                  allow_download: bool = True):
+    """The C++ engine when it is installed (Windows), otherwise the Python reference engine.
+
+    FACEGATE_ENGINE=python forces the reference engine, =native forces the C++ one.
+    """
+    import os
+    import sys
+
+    choice = os.environ.get("FACEGATE_ENGINE", "").lower()
+    if choice != "python" and sys.platform == "win32":
+        from .native import NativeEngine, NativeUnavailable
+
+        try:
+            return NativeEngine(prefer=prefer)
+        except NativeUnavailable as exc:
+            if choice == "native":
+                raise
+            log.info("C++ engine not used: %s", exc)
+    return FaceEngine(prefer=prefer, progress=progress, allow_download=allow_download)
+
+
+_engine = None
 _engine_lock = threading.Lock()
 
 
-def get_engine(progress: ProgressFn | None = None, prefer: str | None = None) -> FaceEngine:
+def get_engine(progress: ProgressFn | None = None, prefer: str | None = None):
     """Process-wide engine, created on first use."""
     global _engine
     with _engine_lock:
         if _engine is None:
-            _engine = FaceEngine(prefer=prefer, progress=progress)
+            _engine = create_engine(progress=progress, prefer=prefer)
         return _engine

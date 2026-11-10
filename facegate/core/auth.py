@@ -6,14 +6,18 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ..config import Settings
 from .align import head_pose_proxy
-from .engine import FaceEngine, enhance_low_light
+from .imaging import enhance_low_light
 from .occlusion import VIEWS
 from .store import Sample, TemplateStore
+
+if TYPE_CHECKING:
+    from .engine import FaceEngine
 
 MIN_FACE_PX = 90           # narrower than this and the embedding is unreliable
 ADAPT_MARGIN = 0.15        # how far above threshold a match must be to be learned from

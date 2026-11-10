@@ -17,10 +17,24 @@ from pathlib import Path
 from . import APP_NAME
 
 
+def is_elevated() -> bool:
+    """True when running as an administrator (or SYSTEM)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (OSError, AttributeError):
+        return False
+
+
 def data_dir() -> Path:
-    """Root for models, templates and settings. Override with FACEGATE_HOME."""
+    """Root for models, templates and settings. FACEGATE_HOME overrides it - but never for an
+    elevated process: it would inherit the *user's* environment, which any program of that user
+    can edit, and so could be pointed at attacker-controlled files."""
     override = os.environ.get("FACEGATE_HOME")
-    if override:
+    if override and not is_elevated():
         root = Path(override)
     elif sys.platform == "win32":
         root = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / APP_NAME
@@ -48,10 +62,12 @@ class Settings:
     # --- camera ---
     camera_index: int = 0
 
-    # --- matching (calibrated on LFW, see tools/eval_lfw.py and README) ---
-    match_threshold: float = 0.40      # cosine similarity that unlocks on its own
-    occlusion_floor: float = 0.30      # a covered face may score this low on the whole face…
-    mask_threshold: float = 0.40       # …if the upper-face view scores at least this
+    # --- matching ---
+    # Calibrated with tools/eval_lfw.py for at most 1 false accept per million stranger
+    # comparisons (the figure Apple quotes for Face ID) on the C++ FP16 pipeline.
+    match_threshold: float = 0.36      # cosine similarity that unlocks on its own
+    occlusion_floor: float = 0.32      # a covered face may score this low on the whole face…
+    mask_threshold: float = 0.50       # …if the upper-face view scores at least this
     occlusion_unlock: bool = True      # allow that second path at all
 
     # --- liveness ---
@@ -73,6 +89,10 @@ class Settings:
 
     # --- windows unlock ---
     windows_unlock: bool = False
+
+    # --- appearance ---
+    theme: str = "classic"             # a palette key from ui/palette.py, or "custom"
+    custom_color: str = "#0a84ff"      # used when theme == "custom"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)

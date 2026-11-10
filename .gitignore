@@ -20,8 +20,18 @@ attempts*.json
 *.flag
 .env
 
-# C++ build output
+# C++ build output, downloaded SDKs, prepared models
 credential_provider/build/
+engine/build/
+engine/third_party/
+engine/models/
+
+# Nuitka output
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+*.exe
 
 # Editors / OS
 .vscode/

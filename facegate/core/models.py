@@ -13,8 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-import onnxruntime as ort
-
 from ..config import models_dir
 
 log = logging.getLogger(__name__)
@@ -168,6 +166,8 @@ def pick_providers(prefer: str | None = None) -> list[str]:
 
     FACEGATE_DEVICE=cpu|dml|cuda forces a choice.
     """
+    import onnxruntime as ort    # imported lazily: the C++ engine does not need it
+
     available = ort.get_available_providers()
     prefer = (prefer or os.environ.get("FACEGATE_DEVICE") or "").lower()
     if prefer in _PROVIDER_ALIASES:
@@ -215,7 +215,9 @@ class Session:
         self._lock = threading.Lock()
 
     @staticmethod
-    def _create(path: Path, providers: list[str], pin_batch: int = 0) -> ort.InferenceSession:
+    def _create(path: Path, providers: list[str], pin_batch: int = 0):
+        import onnxruntime as ort
+
         so = ort.SessionOptions()
         so.log_severity_level = 3
         if "DmlExecutionProvider" in providers:

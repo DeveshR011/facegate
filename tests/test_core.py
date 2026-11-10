@@ -87,9 +87,9 @@ def test_synthetic_occluders_change_the_expected_region():
     "full, mask, occlusion, expected",
     [
         (0.55, 0.10, True, (True, "full")),      # clear match needs nothing else
-        (0.39, 0.10, True, (False, "full")),     # near miss, upper face disagrees
-        (0.34, 0.45, True, (True, "mask")),      # near miss + upper face agrees
-        (0.34, 0.45, False, (False, "full")),    # ...but only when the option is on
+        (0.35, 0.10, True, (False, "full")),     # near miss, upper face disagrees
+        (0.34, 0.55, True, (True, "mask")),      # near miss + upper face agrees
+        (0.34, 0.55, False, (False, "full")),    # ...but only when the option is on
         (0.20, 0.80, True, (False, "full")),     # upper face alone is never enough
         (0.05, 0.05, True, (False, "full")),
     ],
@@ -104,7 +104,8 @@ def test_decide(full, mask, occlusion, expected):
 def test_default_thresholds_are_ordered_sensibly():
     s = Settings()
     assert s.occlusion_floor < s.match_threshold
-    assert 0.25 <= s.occlusion_floor and 0.35 <= s.match_threshold <= 0.5
+    assert 0.25 <= s.occlusion_floor and 0.30 <= s.match_threshold <= 0.5
+    assert s.mask_threshold > s.match_threshold      # the upper face alone must clear a higher bar
 
 
 # ---- template store ------------------------------------------------------
@@ -205,6 +206,42 @@ def test_limiter_success_clears_counter(tmp_path, clock):
     lim.record_success()
     lim.record_failure(); lim.record_failure()
     assert not lim.locked
+
+
+# ---- elevation safety ----------------------------------------------------
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows paths")
+def test_protected_location_check(monkeypatch):
+    from facegate.win.system import in_protected_location
+
+    monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+    monkeypatch.setenv("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    assert in_protected_location(r"C:\Program Files\FaceGate\FaceGate.exe")
+    assert in_protected_location(r"c:\program files (x86)\x\y.exe")                 # case-insensitive
+    assert in_protected_location(r"C:\Windows\System32\x.exe")
+    assert not in_protected_location(r"C:\Users\me\AppData\Local\FaceGate\FaceGate.exe")
+    assert not in_protected_location(r"C:\Program Files Evil\FaceGate.exe")         # prefix trick
+    assert not in_protected_location(r"C:\Program Files\..\Users\me\x.exe")         # traversal
+    assert not in_protected_location(r"C:\Program Files")                           # the folder itself
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
+def test_environment_overrides_are_ignored_when_elevated(monkeypatch, tmp_path):
+    from facegate import config
+    from facegate.core import native
+
+    monkeypatch.setenv("FACEGATE_HOME", str(tmp_path / "attacker"))
+    monkeypatch.setenv("FACEGATE_NATIVE_DIR", str(tmp_path / "attacker"))
+    monkeypatch.setattr(config, "is_elevated", lambda: False)
+    monkeypatch.setattr(native, "is_elevated", lambda: False)
+    assert config.data_dir() == tmp_path / "attacker"
+    assert next(native._candidates())[0] == tmp_path / "attacker"
+
+    monkeypatch.setattr(config, "is_elevated", lambda: True)
+    monkeypatch.setattr(native, "is_elevated", lambda: True)
+    assert config.data_dir() != tmp_path / "attacker"
+    assert all(d != tmp_path / "attacker" for d, _ in native._candidates())
 
 
 # ---- settings ------------------------------------------------------------
