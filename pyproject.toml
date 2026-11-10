@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "facegate"
+version = "0.1.0"
+description = "AI face unlock for Windows apps and the lock screen"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.26,<3"]
+
+[project.optional-dependencies]
+desktop = [
+    "opencv-python>=4.9",
+    "onnxruntime-directml>=1.18",
+    "PySide6-Essentials>=6.6",
+    "psutil>=5.9",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+server = [
+    "opencv-python-headless>=4.9",
+    "onnxruntime>=1.18",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
+]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+facegate = "facegate.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["facegate*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests", "."]
+markers = ["integration: needs the real model weights and the LFW images"]
+filterwarnings = ["ignore::DeprecationWarning:starlette.*", "ignore:Using `httpx`"]

@@ -1,0 +1,7 @@
+# Desktop app (Windows). GPU inference via DirectML - no CUDA install needed.
+numpy>=1.26,<3
+opencv-python>=4.9
+onnxruntime-directml>=1.18
+PySide6-Essentials>=6.6
+psutil>=5.9
+pywin32>=306

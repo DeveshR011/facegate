@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Datasets, caches, model weights
+.cache/
+*.onnx
+*.npz
+
+# Never commit biometric data or settings
+templates.bin
+settings.json
+attempts*.json
+*.flag
+.env
+
+# C++ build output
+credential_provider/build/
+
+# Editors / OS
+.vscode/
+.idea/
+.claude/
+Thumbs.db
+desktop.ini
