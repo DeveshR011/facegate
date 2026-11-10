@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+.cache
+.pytest_cache
+__pycache__
+*.pyc
+credential_provider
+tests
+tools
+docs
+*.md

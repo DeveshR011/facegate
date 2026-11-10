@@ -1,0 +1,52 @@
+# docker compose up --build              -> CPU API on http://127.0.0.1:8000
+# docker compose --profile gpu up --build -> GPU API on http://127.0.0.1:8001
+#
+# Ports are bound to localhost on purpose: this is a biometric endpoint.
+# Set FACEGATE_API_KEY (e.g. in a .env file) before exposing it any further.
+
+services:
+  facegate:
+    build: .
+    image: facegate:cpu
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - facegate-data:/data
+    environment:
+      FACEGATE_API_KEY: ${FACEGATE_API_KEY:-}
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  facegate-gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: facegate:gpu
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - facegate-data:/data
+    environment:
+      FACEGATE_API_KEY: ${FACEGATE_API_KEY:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  facegate-data:
