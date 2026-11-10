@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from facegate import config  # noqa: E402
 from facegate.core.align import ARCFACE_DST  # noqa: E402
 from facegate.core.detector import Face  # noqa: E402
 from facegate.core.occlusion import VIEWS  # noqa: E402
@@ -18,6 +19,9 @@ from facegate.core.occlusion import VIEWS  # noqa: E402
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("FACEGATE_HOME", str(tmp_path / "home"))
+    # data_dir() ignores FACEGATE_HOME when elevated. CI runners and admin terminals are elevated,
+    # so without this the tests would read and overwrite the real templates and settings.
+    monkeypatch.setattr(config, "is_elevated", lambda: False)
     yield tmp_path / "home"
 
 
