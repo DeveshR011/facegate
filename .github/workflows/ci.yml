@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Tests + credential provider (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Unit tests
+        run: python -m pytest tests -q
+      - name: Build credential provider
+        run: |
+          cmake -S credential_provider -B credential_provider/build -A x64
+          cmake --build credential_provider/build --config Release
+      - name: Credential provider harness
+        run: ctest --test-dir credential_provider/build -C Release --output-on-failure
+
+  container:
+    name: Container image builds and imports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CPU image
+        run: docker build -t facegate:cpu .
+      - name: API imports inside the image
+        run: docker run --rm facegate:cpu python -c "from facegate.service.api import create_app; create_app(); print('ok')"
