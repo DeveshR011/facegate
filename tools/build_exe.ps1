@@ -3,6 +3,11 @@
 #   tools\build_exe.ps1               # folder build  -> dist\FaceGate\FaceGate.exe  (fast start; installable)
 #   tools\build_exe.ps1 -OneFile      # single file   -> dist\FaceGate-portable.exe  (convenient; no elevated features)
 #
+# Rebuilds are incremental: with MSVC, Nuitka caches every compiled C file with its bundled clcache
+# (ccache's MSVC counterpart) under %LOCALAPPDATA%\Nuitka\Nuitka\Cache\clcache; the hit rate is
+# printed at the end. packaging\nuitka\facegate_plugin.py bundles the engine and models and trims
+# what Windows never loads.
+#
 # Prerequisites (one-off):
 #   pip install -r requirements.txt nuitka ordered-set zstandard onnx onnxconverter-common
 #   engine\build.ps1                  C++ engine + onnxruntime/DirectML runtime
@@ -18,14 +23,6 @@ Set-Location $root
 $py = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { $py = "python" }
 
-$engine = "engine\build\Release"
-$required = @("$engine\facegate_engine.dll", "$engine\onnxruntime.dll", "$engine\DirectML.dll",
-              "$engine\onnxruntime_providers_shared.dll", "engine\models\manifest.json",
-              "credential_provider\build\Release\FaceGateCP.dll", "assets\facegate.ico")
-foreach ($f in $required) {
-    if (-not (Test-Path $f)) { throw "Missing $f - see the prerequisites at the top of this script." }
-}
-
 # A running copy (even an elevated one, whose path cannot be read) locks its exe; replacing the
 # output would then fail halfway, after the compile. Check before spending minutes on it.
 foreach ($f in "dist\FaceGate\FaceGate.exe", "dist\FaceGate-portable.exe") {
@@ -38,22 +35,28 @@ foreach ($f in "dist\FaceGate\FaceGate.exe", "dist\FaceGate-portable.exe") {
 $version = (& $py -c "import facegate; print(facegate.__version__)").Trim()
 $mode = if ($OneFile) { "--onefile" } else { "--standalone" }
 $nuitka = @(
-    "-m", "nuitka", $mode, "--msvc=latest", "--jobs=$Jobs",
+    "-m", "nuitka", $mode, "--msvc=latest", "--jobs=$Jobs", "--assume-yes-for-downloads",
+    # Link-time optimisation redoes code generation for all 200 C files at link time, on every
+    # build, cached or not (3 of 4.3 minutes here). Inference runs in the C++ engine, so the
+    # compiled Python gains nothing worth that.
+    "--lto=no",
     "--enable-plugin=pyside6", "--include-package=facegate",
+    # Engine, runtime, models and the lock-screen DLL; Windows-only trims; bytecode for constant tables.
+    "--user-plugin=packaging\nuitka\facegate_plugin.py",
     # Not needed at run time: the C++ engine replaces ONNX Runtime for Python, and the HTTP API
     # and the model-conversion tooling are for source installs and the container.
     "--nofollow-import-to=onnxruntime,onnx,onnxconverter_common,fastapi,uvicorn,starlette,pydantic,pydantic_core,httpx,anyio,h11,pytest,tkinter,setuptools,pip",
+    # OpenCV's ffmpeg plugin (29 MB) decodes video files; webcams use DirectShow / Media
+    # Foundation, which are built into cv2.pyd (`FaceGate.exe selftest` lists them).
+    "--noinclude-dlls=cv2/opencv_videoio_ffmpeg*.dll",
+    # The app paints its own icons, uses the built-in Fusion style and no TLS: only the
+    # platform plugin is needed.
+    "--noinclude-qt-plugins=tls,imageformats,iconengines,styles",
     "--windows-console-mode=attach",
     "--windows-icon-from-ico=assets\facegate.ico",
     "--company-name=FaceGate", "--product-name=FaceGate",
     "--file-description=FaceGate face unlock",
     "--file-version=$version.0", "--product-version=$version.0",
-    "--include-data-files=$engine\facegate_engine.dll=native\facegate_engine.dll",
-    "--include-data-files=$engine\onnxruntime.dll=native\onnxruntime.dll",
-    "--include-data-files=$engine\onnxruntime_providers_shared.dll=native\onnxruntime_providers_shared.dll",
-    "--include-data-files=$engine\DirectML.dll=native\DirectML.dll",
-    "--include-data-dir=engine\models=native\models",
-    "--include-data-files=credential_provider\build\Release\FaceGateCP.dll=native\FaceGateCP.dll",
     "--output-dir=dist", "--output-filename=FaceGate.exe"
 )
 if ($OneFile) {
@@ -64,9 +67,17 @@ $nuitka += "launch_facegate.py"
 
 Write-Host "Compiling with Nuitka ($mode, $Jobs jobs) - the first build takes a while..."
 $started = Get-Date
-& $py @nuitka
-if ($LASTEXITCODE -ne 0) { throw "Nuitka failed (exit $LASTEXITCODE)" }
+$log = Join-Path $root "dist\nuitka-build.log"
+New-Item -ItemType Directory -Force (Split-Path $log) | Out-Null
+# Nuitka reports progress on stderr; keep it as plain text (and in a log) rather than as errors.
+$ErrorActionPreference = "Continue"
+& $py @nuitka 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+$exit = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+if ($exit -ne 0) { throw "Nuitka failed (exit $exit) - see $log" }
 Write-Host ("Compiled in {0:N1} min" -f ((Get-Date) - $started).TotalMinutes)
+$cache = Select-String -Path $log -Pattern "C files using clcache with .*" | Select-Object -Last 1
+if ($cache) { Write-Host ("C compiler cache: " + $cache.Matches[0].Value) }
 
 if ($OneFile) {
     $exe = Join-Path $root "dist\FaceGate-portable.exe"

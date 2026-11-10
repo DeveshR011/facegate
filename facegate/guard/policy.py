@@ -20,7 +20,7 @@ SYSTEM_CRITICAL = {
 def can_protect(path: str) -> tuple[bool, str]:
     name = os.path.basename(path).lower()
     if not name.endswith(".exe"):
-        return False, "Only .exe files can be protected."
+        return False, "Only programs (.exe) go here. Lock other files under Files & Folders."
     if name in SYSTEM_CRITICAL:
         return False, f"{name} is part of Windows or FaceGate itself and cannot be locked."
     return True, ""

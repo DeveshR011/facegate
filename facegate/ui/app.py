@@ -47,12 +47,13 @@ def _server_name() -> str:
     return f"{APP_NAME}-{getpass.getuser()}"
 
 
-def _signal_running_instance() -> bool:
+def _signal_running_instance(message: bytes = b"show") -> bool:
+    """Hand `message` to the copy already running ("show", or "open\\n<path>")."""
     sock = QLocalSocket()
     sock.connectToServer(_server_name())
     if not sock.waitForConnected(300):
         return False
-    sock.write(b"show")
+    sock.write(message)
     sock.waitForBytesWritten(300)
     sock.disconnectFromServer()
     return True
@@ -73,6 +74,8 @@ def _setup_logging() -> None:
 def run(argv: list[str]) -> int:
     start_hidden = "--tray" in argv
     takeover = "--takeover" in argv
+    at = argv.index("--open") + 1 if "--open" in argv else 0
+    open_path = argv[at] if 0 < at < len(argv) else None
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
@@ -87,7 +90,7 @@ def run(argv: list[str]) -> int:
         deadline = time.monotonic() + 6
         while _signal_running_instance() and time.monotonic() < deadline:
             time.sleep(0.25)
-    elif _signal_running_instance():
+    elif _signal_running_instance(b"open\n" + open_path.encode("utf-8") if open_path else b"show"):
         return 0
 
     _setup_logging()
@@ -98,8 +101,8 @@ def run(argv: list[str]) -> int:
 
     ctx = AppContext()
     overlay = AuthOverlay(ctx)
-    window = MainWindow(ctx, overlay)
     guard = GuardController(ctx, overlay) if sys.platform == "win32" else None
+    window = MainWindow(ctx, overlay, guard)
 
     def show_window() -> None:
         window.show()
@@ -107,13 +110,40 @@ def run(argv: list[str]) -> int:
         window.raise_()
         window.activateWindow()
 
+    def open_locked(path: str) -> None:
+        if guard is None or not guard.request_open(path):
+            tray.showMessage(APP_NAME, f"{path} is not locked by {APP_NAME}.")
+
+    def on_message(message: bytes) -> None:
+        if message.startswith(b"open\n"):
+            open_locked(message[5:].decode("utf-8", "replace"))
+        else:
+            show_window()
+
     def on_connection() -> None:
         sock = server.nextPendingConnection()
-        if sock is not None:
-            sock.readyRead.connect(lambda: (sock.readAll(), show_window()))
-            sock.disconnected.connect(sock.deleteLater)
+        if sock is None:
+            return
+        received = bytearray()
+        sock.readyRead.connect(lambda: received.extend(bytes(sock.readAll())))
+
+        def finished() -> None:
+            received.extend(bytes(sock.readAll()))
+            on_message(bytes(received))
+            sock.deleteLater()
+
+        sock.disconnected.connect(finished)
 
     server.newConnection.connect(on_connection)
+
+    if sys.platform == "win32":
+        from ..win import shell
+
+        def sync_shell_verb() -> None:      # Explorer's "Unlock with FaceGate", while items are locked
+            shell.set_registered(bool(ctx.settings.locked_items))
+
+        ctx.changed.connect(sync_shell_verb)
+        sync_shell_verb()
 
     def quit_app() -> None:
         # Quitting stops the guard, so it needs the same proof as unlocking an app.
@@ -126,6 +156,8 @@ def run(argv: list[str]) -> int:
     tray.setToolTip(APP_NAME)
     menu = QMenu()
     menu.addAction(QAction("Open FaceGate", menu, triggered=show_window))
+    if guard is not None:
+        menu.addAction(QAction("Lock Files Now", menu, triggered=guard.lock_all))
     menu.addSeparator()
     menu.addAction(QAction("Quit", menu, triggered=quit_app))
     tray.setContextMenu(menu)
@@ -143,6 +175,8 @@ def run(argv: list[str]) -> int:
     ctx.load_engine()
     if not start_hidden:
         show_window()
+    if open_path:
+        open_locked(open_path)
     log.info("started (hidden=%s)", start_hidden)
     return app.exec()
 

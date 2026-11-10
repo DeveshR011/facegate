@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
-from PySide6.QtCore import QFileInfo, QSize, Qt
+from PySide6.QtCore import QFileInfo, QSize, Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDialog,
                                QFileIconProvider, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -13,7 +14,8 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFileDia
                                QScrollArea, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
-from ..config import ProtectedApp, data_dir
+from ..config import LockedItem, ProtectedApp, data_dir
+from ..guard.locks import can_lock, norm
 from ..guard.policy import can_protect
 from .appearance import AppearanceCard
 from .context import AppContext
@@ -108,9 +110,9 @@ class PasswordDialog(QDialog):
 
 
 class MainWindow(QWidget):
-    def __init__(self, ctx: AppContext, overlay: AuthOverlay):
+    def __init__(self, ctx: AppContext, overlay: AuthOverlay, guard=None):
         super().__init__()
-        self.ctx, self.overlay = ctx, overlay
+        self.ctx, self.overlay, self.guard = ctx, overlay, guard
         self.setObjectName("root")
         self.setWindowTitle(APP_NAME)
         self.resize(560, 800)
@@ -200,6 +202,31 @@ class MainWindow(QWidget):
         root.addWidget(footnote(
             "After a successful unlock the app stays open until you close it, and can be "
             f"reopened without a scan for {self.ctx.settings.grace_seconds} seconds."))
+
+        # ---- files & folders ----
+        self.items_layout = None
+        if guard is not None:
+            root.addWidget(section_label("Files & Folders"))
+            self.items_frame, self.items_layout = card()
+            root.addWidget(self.items_frame)
+            buttons = QHBoxLayout(); buttons.setContentsMargins(0, 10, 0, 0); buttons.setSpacing(8)
+            add_files = QPushButton("Add Files…"); add_files.clicked.connect(self._add_files)
+            add_folder = QPushButton("Add Folder…"); add_folder.clicked.connect(self._add_folder)
+            buttons.addWidget(add_files); buttons.addWidget(add_folder); buttons.addStretch(1)
+            root.addLayout(buttons)
+            root.addWidget(footnote(
+                "Locked items refuse every program, Explorer included. Unlock one with Open here, by "
+                "right-clicking it and choosing Unlock with FaceGate, or simply by opening it in most "
+                f"apps. Each locks again {self.ctx.settings.relock_minutes} minutes after unlocking "
+                "and when FaceGate quits."))
+            guard.locks_changed.connect(self._rebuild_items)
+            guard.lock_failed.connect(
+                lambda path, why: QMessageBox.warning(self, APP_NAME, f"Could not lock {path}:\n\n{why}"))
+            self._countdown = QTimer(self)
+            self._countdown.setInterval(20_000)
+            self._countdown.timeout.connect(
+                lambda: self.isVisible() and self.guard.locks.open_items() and self._rebuild_items())
+            self._countdown.start()
 
         # ---- windows ----
         root.addWidget(section_label("Windows"))
@@ -296,6 +323,7 @@ class MainWindow(QWidget):
         self.appearance.sync()
         self.header_glyph.set_palette(self.appearance.current())
         self._rebuild_apps()
+        self._rebuild_items()
         self._refresh_windows()
 
     def _refresh_windows(self) -> None:
@@ -398,6 +426,85 @@ class MainWindow(QWidget):
             return
         self.ctx.settings.protected_apps.remove(app)
         self.ctx.save()
+
+    # ---- files & folders -------------------------------------------------
+
+    def _rebuild_items(self) -> None:
+        if self.items_layout is None:
+            return
+        while self.items_layout.count():
+            item = self.items_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        items = self.ctx.settings.locked_items
+        if not items:
+            self.items_layout.addWidget(Row("Nothing locked yet", "Add files of any type, or whole folders."))
+            return
+        for i, item in enumerate(items):
+            if i:
+                self.items_layout.addWidget(separator(56))
+            state, left = self.guard.item_state(item.path)
+            status = {
+                "locked": "Locked",
+                "open": f"Unlocked · locks again in {max(1, math.ceil(left / 60))} min",
+                "missing": "Not found",
+                "error": f"Not locked: {self.guard.lock_errors.get(norm(item.path), '')}",
+            }[state]
+            kind = (QFileIconProvider.IconType.Folder if os.path.isdir(item.path)
+                    else QFileIconProvider.IconType.File)       # generic: a locked file cannot be read
+            icon = QLabel(); icon.setPixmap(self._icons.icon(kind).pixmap(28, 28)); icon.setFixedSize(28, 28)
+            controls = QWidget(); cl = QHBoxLayout(controls); cl.setContentsMargins(0, 0, 0, 0); cl.setSpacing(6)
+            open_btn = QPushButton("Open"); open_btn.setEnabled(state != "missing")
+            open_btn.clicked.connect(lambda _c=False, p=item.path: self.guard.request_open(p))
+            cl.addWidget(open_btn)
+            if state in ("open", "error"):
+                lock_btn = QPushButton("Lock")
+                lock_btn.clicked.connect(lambda _c=False, p=item.path: self.guard.lock_item(p))
+                cl.addWidget(lock_btn)
+            remove = QPushButton("×"); remove.setObjectName("ghost"); remove.setToolTip("Remove (unlocks it)")
+            remove.setCursor(Qt.CursorShape.PointingHandCursor)
+            remove.clicked.connect(lambda _c=False, it=item: self._remove_item(it))
+            cl.addWidget(remove)
+            row = Row(item.name or os.path.basename(item.path), f"{status} · {item.path}", controls, leading=icon)
+            row.subtitle.setWordWrap(False)
+            row.subtitle.setToolTip(item.path)
+            row.subtitle.setMaximumWidth(300)
+            self.items_layout.addWidget(row)
+
+    def _add_items(self, paths: list[str]) -> None:
+        if not self.ctx.store.is_enrolled:
+            QMessageBox.information(self, APP_NAME, "Set up Face ID first - a locked item opens only "
+                                                    "with your face (or your Windows password).")
+            return
+        items = self.ctx.settings.locked_items
+        problems = []
+        for path in paths:
+            ok, why = can_lock(path, [i.path for i in items])
+            if not ok:
+                problems.append(f"{os.path.basename(os.path.normpath(path)) or path}: {why}")
+                continue
+            path = os.path.abspath(path)
+            items.append(LockedItem(path=path, name=os.path.basename(os.path.normpath(path))))
+        if problems:
+            QMessageBox.warning(self, APP_NAME, "\n\n".join(problems))
+        self.ctx.save()                 # the guard locks the new items in the background
+
+    def _add_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Choose Files to Lock", os.path.expanduser("~"),
+                                                "All files (*)")
+        if paths:
+            self._add_items(paths)
+
+    def _add_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose a Folder to Lock", os.path.expanduser("~"))
+        if path:
+            self._add_items([path])
+
+    def _remove_item(self, item: LockedItem) -> None:
+        if not self._confirm():
+            return
+        self.ctx.settings.locked_items.remove(item)
+        self.ctx.save()                 # the guard unlocks it
 
     # ---- face id actions -------------------------------------------------
 

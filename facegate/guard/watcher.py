@@ -35,10 +35,15 @@ class ProcessWatcher(threading.Thread):
         interval: float = 0.03,
         list_pids: Callable[[], list[int]] = psutil.pids,
         exe_of: Callable[[int], str | None] = _exe_of,
+        on_other: Callable[[int, str], None] | None = None,
+        watch_other: Callable[[], bool] = lambda: False,
     ):
+        """`on_other` sees every other new process (pid, exe) while `watch_other()` is true -
+        used to catch programs asked to open a locked file or folder."""
         super().__init__(name="facegate-watcher", daemon=True)
         self._protected, self._on_start = protected, on_start
         self._on_exit, self._on_existing = on_exit, on_existing
+        self._on_other, self._watch_other = on_other, watch_other
         self._interval = interval
         self._list_pids, self._exe_of = list_pids, exe_of
         self._stop_evt = threading.Event()
@@ -82,13 +87,16 @@ class ProcessWatcher(threading.Thread):
         if not new:
             return
         protected = self._protected()
-        if not protected:
+        other = self._on_other is not None and self._watch_other()
+        if not protected and not other:
             return
         for pid in new:
             path = self._exe_of(pid)
             if path and path in protected:
                 self._tracked[pid] = path
                 self._on_start(pid, path)
+            elif path and other:
+                self._on_other(pid, path)
 
     def run(self) -> None:
         self._adopt_running()

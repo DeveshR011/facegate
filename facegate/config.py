@@ -58,6 +58,12 @@ class ProtectedApp:
 
 
 @dataclass
+class LockedItem:
+    path: str          # a file of any type, or a folder
+    name: str = ""
+
+
+@dataclass
 class Settings:
     # --- camera ---
     camera_index: int = 0
@@ -87,6 +93,10 @@ class Settings:
     grace_seconds: int = 20            # re-open without a scan within this window
     protected_apps: list[ProtectedApp] = field(default_factory=list)
 
+    # --- file & folder lock ---
+    locked_items: list[LockedItem] = field(default_factory=list)
+    relock_minutes: int = 5            # an unlocked item locks itself again after this long
+
     # --- windows unlock ---
     windows_unlock: bool = False
 
@@ -106,8 +116,14 @@ class Settings:
             for a in clean.pop("protected_apps", [])
             if isinstance(a, dict) and a.get("path")
         ]
+        items = [
+            LockedItem(**{k: v for k, v in a.items() if k in ("path", "name")})
+            for a in clean.pop("locked_items", [])
+            if isinstance(a, dict) and a.get("path")
+        ]
         s = cls(**clean)
         s.protected_apps = apps
+        s.locked_items = items
         return s
 
 

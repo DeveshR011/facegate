@@ -2,6 +2,8 @@
 
     FaceGate.exe                       settings window (+ tray, + app guard)
     FaceGate.exe --tray                start hidden in the tray
+    FaceGate.exe open <path>           unlock a locked file or folder, then open it
+                                       (Explorer's "Unlock with FaceGate")
     FaceGate.exe selftest [--image F] [--output F]
                                        load the engine and run it once; no camera, no stored data
     FaceGate.exe verify                one recognition attempt in the terminal
@@ -93,6 +95,9 @@ def _selftest(argv: list[str]) -> int:
         except ImportError:
             deps[name] = False
     report["dependencies"] = deps
+    # Webcams need DirectShow / Media Foundation, built into cv2 (the ffmpeg plugin is not shipped).
+    report["camera_backends"] = [cv2.videoio_registry.getBackendName(b)
+                                 for b in cv2.videoio_registry.getCameraBackends()]
     text = json.dumps(report, indent=2)
     print(text)
     if option("--output"):          # a windowed build has no console to print to
@@ -111,6 +116,9 @@ def main() -> int:
     if command == "gui":
         from .ui.app import run
         return run(args)
+    if command == "open" and len(args) > 1:
+        from .ui.app import run
+        return run(["--tray", "--open", args[1]])
     if command == "selftest":
         return _selftest(args[1:])
     if command == "verify":
