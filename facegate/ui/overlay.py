@@ -34,13 +34,19 @@ class AuthWorker(QThread):
         self._stop = True
 
     def run(self) -> None:
-        engine = self.ctx.wait_engine()
-        if engine is None:
-            self.done.emit(False, "error", self.ctx.engine_error or "Recognition engine unavailable")
-            return
+        with self.ctx.engine_user():
+            self._run()
+
+    def _run(self) -> None:
         self.ctx.store.refresh()
         try:
+            # The camera starts while the engine loads (if it was asleep): both take most of a
+            # second, so overlapping them hides most of the load.
             with Camera(self.ctx.settings.camera_index) as cam:
+                engine = self.ctx.wait_engine()
+                if engine is None:
+                    self.done.emit(False, "error", self.ctx.engine_error or "Recognition engine unavailable")
+                    return
                 cam.warm_up()
                 session = AuthSession(engine, self.ctx.store, self.ctx.settings)
                 while not self._stop:
@@ -61,7 +67,8 @@ class AuthWorker(QThread):
 
 
 class AuthOverlay(QWidget):
-    completed = Signal(bool)
+    succeeded = Signal()        # the moment identity is confirmed (the tick animation still plays)
+    completed = Signal(bool)    # after the overlay has faded out
 
     def __init__(self, ctx: AppContext):
         super().__init__(None)
@@ -228,6 +235,7 @@ class AuthOverlay(QWidget):
             self._show_password("Too many attempts. Enter your password.")
             return
         self._stop_worker()
+        self.ctx.load_engine()                     # wakes it if it was unloaded while idle
         self.stack.setCurrentIndex(0)
         self.status.setText("Looking for you…" if self.ctx.engine else "Starting up…")
         self.glyph.set_state(GlyphState.SCANNING)
@@ -248,6 +256,7 @@ class AuthOverlay(QWidget):
             self.stack.setCurrentIndex(0)
             self.cancel_scan.setVisible(False)
             self.glyph.set_state(GlyphState.SUCCESS)
+            self.succeeded.emit()
             return
         if state in (AuthState.FAILED.value, AuthState.SPOOF.value):
             self.ctx.limiter.record_failure()
@@ -294,6 +303,7 @@ class AuthOverlay(QWidget):
             self.cancel_scan.setVisible(False)
             self.status.setText("")
             self.glyph.set_state(GlyphState.SUCCESS)
+            self.succeeded.emit()
         else:
             self.glyph.set_state(GlyphState.FAILURE)
             self.status.setText("Incorrect password")

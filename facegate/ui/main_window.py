@@ -222,11 +222,10 @@ class MainWindow(QWidget):
             guard.locks_changed.connect(self._rebuild_items)
             guard.lock_failed.connect(
                 lambda path, why: QMessageBox.warning(self, APP_NAME, f"Could not lock {path}:\n\n{why}"))
-            self._countdown = QTimer(self)
+            self._countdown = QTimer(self)               # runs only while the window is shown
             self._countdown.setInterval(20_000)
             self._countdown.timeout.connect(
-                lambda: self.isVisible() and self.guard.locks.open_items() and self._rebuild_items())
-            self._countdown.start()
+                lambda: self.guard.locks.open_items() and self._rebuild_items())
 
         # ---- windows ----
         root.addWidget(section_label("Windows"))
@@ -618,6 +617,18 @@ class MainWindow(QWidget):
                 "Windows unlock is on.\n\nLock your PC with Win+L to try it. Your password and PIN "
                 "remain available under “Sign-in options”.")
         self._refresh_windows()
+
+    def showEvent(self, event) -> None:
+        self.ctx.load_engine()                # enrollment and testing need it; idle unload undoes this
+        if self.guard is not None:
+            self._countdown.start()
+        self.refresh()
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:
+        if self.guard is not None:
+            self._countdown.stop()
+        super().hideEvent(event)
 
     def closeEvent(self, event) -> None:
         event.ignore()          # keep guarding from the tray

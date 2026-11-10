@@ -169,3 +169,63 @@ def test_watcher_and_policy_together(clock):
     clock.advance(11)
     table.procs[3] = APP; w.step()
     assert verdicts[-1] is Verdict.CHALLENGE
+
+
+class CountingTable(Table):
+    def __init__(self):
+        super().__init__()
+        self.listed = 0
+
+    def pids(self):
+        self.listed += 1
+        return super().pids()
+
+
+def test_watcher_does_no_work_while_nothing_is_protected():
+    table, protected = CountingTable(), set()
+    table.procs = {1: OTHER}
+    w, events = make_watcher(table, protected)
+    w._adopt_running()
+    table.listed = 0
+    for _ in range(5):
+        w.step()
+    assert table.listed == 0                          # dormant: not even a process listing
+
+    table.procs[2] = APP                              # started while nothing was protected
+    protected.add(APP)
+    w.step()                                          # waking up only takes a fresh snapshot
+    assert events == []
+    table.procs[3] = APP
+    w.step()
+    assert events == [("start", 3, APP)]
+
+
+def test_a_new_window_wakes_the_watcher_without_polling():
+    import os
+    import subprocess
+    import sys
+    import threading
+    import time
+
+    import pytest
+
+    if sys.platform != "win32":
+        pytest.skip("window events are Windows-only")
+    charmap = r"c:\windows\system32\charmap.exe"
+    if not os.path.exists(charmap):
+        pytest.skip("Character Map is not installed (a Windows Server core image?)")
+    started = threading.Event()
+    w = ProcessWatcher(protected=lambda: {charmap}, on_start=lambda pid, path: started.set(),
+                       on_exit=lambda *a: None, on_existing=lambda *a: None,
+                       interval=60.0)                 # the poll alone would take a minute
+    w.start()
+    time.sleep(0.3)
+    p = subprocess.Popen([charmap])
+    try:
+        t = time.monotonic()
+        assert started.wait(3), "the new window did not wake the watcher"
+        assert time.monotonic() - t < 1.0
+    finally:
+        w.stop()
+        p.kill()
+        p.wait()

@@ -55,6 +55,7 @@ VICTIM = r"C:\Windows\System32\PING.EXE"
 
 
 class FakeOverlay(QObject):
+    succeeded = Signal()
     completed = Signal(bool)
 
     def __init__(self):
@@ -66,7 +67,13 @@ class FakeOverlay(QObject):
         self.active = True
         self.titles.append(title)
 
+    def confirm(self) -> None:
+        """Recognised: the real overlay says so at once, then plays its tick and fades out."""
+        self.succeeded.emit()
+
     def finish(self, ok: bool) -> None:
+        if ok:
+            self.succeeded.emit()
         self.active = False
         self.completed.emit(ok)
 
@@ -97,10 +104,12 @@ def status(pid):
 
 
 @pytest.fixture
-def guard_env():
+def guard_env(monkeypatch):
     from facegate.config import Settings
     from facegate.ui.guard_controller import GuardController
 
+    # ping.exe opens no window, so only the poll sees it; poll fast to keep the tests quick.
+    monkeypatch.setattr(GuardController, "poll_interval", 0.03)
     app = QCoreApplication.instance() or QCoreApplication([])
     settings = Settings()
     settings.protected_apps = [ProtectedApp(VICTIM, "Ping", True)]
@@ -146,6 +155,66 @@ def test_protected_app_is_frozen_then_released_on_success(guard_env):
     third = launch()                                       # trusted while an instance is alive
     time.sleep(0.4); app.processEvents()
     assert status(third.pid) == psutil.STATUS_RUNNING and len(overlay.titles) == 1
+
+
+def test_engine_unloads_when_idle_and_loads_again_on_demand(monkeypatch):
+    from facegate.core import engine as core_engine
+    from facegate.ui.context import AppContext
+
+    app = QCoreApplication.instance() or QCoreApplication([])
+
+    class Engine:
+        provider = "Fake"
+
+        def __init__(self):
+            self.closed = False
+
+        def detect(self, *a, **k):
+            return []
+
+        def embed_views(self, *a, **k):
+            return {}
+
+        def close(self):
+            self.closed = True
+
+    made: list[Engine] = []
+    monkeypatch.setattr(core_engine, "get_engine", lambda **_: made.append(Engine()) or made[-1])
+    ctx = AppContext()
+    ctx.settings.engine_idle_minutes = 1
+    ctx.load_engine()
+    assert pump(app, lambda: ctx.engine is not None)
+    assert not ctx.release_engine_if_idle()            # just used
+
+    ctx._last_used -= 120
+    with ctx.engine_user():
+        assert not ctx.release_engine_if_idle()        # a scan is using it
+    ctx._last_used -= 120
+    ctx.busy = lambda: True
+    assert not ctx.release_engine_if_idle()            # overlay or window open
+    ctx.busy = lambda: False
+    ctx._last_used -= 120
+    assert ctx.release_engine_if_idle()
+    assert ctx.engine is None and made[0].closed
+
+    ctx.load_engine()                                  # the next scan wakes it
+    assert pump(app, lambda: ctx.engine is not None) and len(made) == 2
+    ctx.settings.engine_idle_minutes = 0               # 0 = keep it loaded
+    ctx._last_used -= 10_000
+    assert not ctx.release_engine_if_idle()
+
+
+@pytestmark_win
+def test_app_is_released_the_moment_identity_is_confirmed(guard_env):
+    app, ctx, overlay, controller, launch = guard_env
+    p = launch()
+    assert pump(app, lambda: overlay.active)
+    assert status(p.pid) == psutil.STATUS_STOPPED
+    overlay.confirm()                                      # tick still animating, overlay still up
+    assert pump(app, lambda: status(p.pid) == psutil.STATUS_RUNNING)
+    overlay.finish(True)                                   # fading out does not act a second time
+    app.processEvents()
+    assert status(p.pid) == psutil.STATUS_RUNNING and len(overlay.titles) == 1
 
 
 @pytestmark_win

@@ -223,6 +223,22 @@ def delete_unlock_secret() -> None:
         win32security.LsaClose(policy)
 
 
+# ---- memory --------------------------------------------------------------
+
+def trim_working_set() -> None:
+    """Hand this process's idle memory back to Windows when it goes dormant. Nothing is lost:
+    pages come back from the standby list on first touch."""
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+        psapi.EmptyWorkingSet(kernel32.GetCurrentProcess())
+    except (OSError, AttributeError):
+        pass
+
+
 # ---- executables ---------------------------------------------------------
 
 def norm_exe(path: str) -> str:

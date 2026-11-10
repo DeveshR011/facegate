@@ -9,8 +9,10 @@ Three kinds of request share one overlay, one at a time:
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
+import sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -51,6 +53,15 @@ def _kill(pid: int) -> None:
         pass
 
 
+def _allow_foreground(pids: list[int]) -> None:
+    """Let a released app bring its window to the front. The overlay holds the foreground, and
+    Windows only lets the foreground process grant this."""
+    if sys.platform != "win32":
+        return
+    for pid in pids:
+        ctypes.windll.user32.AllowSetForegroundWindow(pid)
+
+
 def _cmdline(pid: int) -> list[str]:
     try:
         return psutil.Process(pid).cmdline()
@@ -76,6 +87,10 @@ class GuardController(QObject):
     locks_changed = Signal()
     lock_failed = Signal(str, str)     # item, message - only for items that exist
 
+    # Seconds between process-list polls. New windows wake the watcher at once, so this only
+    # bounds how late a program that never opens a window is noticed.
+    poll_interval = 1.0
+
     def __init__(self, ctx: AppContext, overlay: AuthOverlay, ops: LockOps | None = None,
                  open_item=_open_with_shell):
         super().__init__()
@@ -94,14 +109,15 @@ class GuardController(QObject):
         self._own_exe = norm_exe(current_exe())
 
         self._closed = False
+        self._settled = False                   # the current request was already acted on
         self._challenge.connect(self._enqueue)
         self._call.connect(self._run_call)      # a bound method: Qt queues it onto this thread
+        self.overlay.succeeded.connect(self._on_succeeded)
         self.overlay.completed.connect(self._on_completed)
         self.ctx.changed.connect(self.sync)
-        self._relock_timer = QTimer(self)
+        self._relock_timer = QTimer(self)       # runs only while something is unlocked
         self._relock_timer.setInterval(5000)
         self._relock_timer.timeout.connect(self._relock_due)
-        self._relock_timer.start()
         self.sync()
 
     # ---- configuration ---------------------------------------------------
@@ -141,6 +157,7 @@ class GuardController(QObject):
                 on_start=self._on_start,
                 on_exit=self.policy.on_exit,
                 on_existing=self.policy.on_existing,
+                interval=self.poll_interval,
                 on_other=self._on_other,
                 watch_other=self.locks.watching,
             )
@@ -188,6 +205,8 @@ class GuardController(QObject):
         if due:
             log.info("time up: locking %d item(s) again", len(due))
             self._background(self._ops.lock, due)
+        if not self.locks.open_items():
+            self._relock_timer.stop()
 
     def _background(self, fn, items: list[str], then=None) -> None:
         """Run lock/unlock off the GUI thread - a large folder takes seconds - in order, one at a
@@ -228,6 +247,8 @@ class GuardController(QObject):
         minutes = self.ctx.settings.relock_minutes
         for item in items:
             self.locks.mark_open(item, minutes)   # now, so a second program is not challenged again
+        if items and not self._closed:
+            self._relock_timer.start()
 
         def done(errors: dict[str, str]) -> None:
             for item in errors:
@@ -296,13 +317,28 @@ class GuardController(QObject):
         target = key if kind == APP else (self.locks.covering(key) or [key])[0]
         self.overlay.start(f"Unlock {self._names.get(target, os.path.basename(target) or 'app')}")
 
+    def _on_succeeded(self) -> None:
+        """Identity confirmed: release right away, while the overlay still plays its tick
+        (waiting for the animation and fade-out would hold the app for another 1.5 s)."""
+        if self._current is not None and not self._settled:
+            self._settled = True
+            self._settle(self._current, True)
+
     def _on_completed(self, ok: bool) -> None:
         request, self._current = self._current, None
+        settled, self._settled = self._settled, False
         if request is None:
             return                            # the overlay was used by someone else
+        if not settled:
+            self._settle(request, ok)
+        QTimer.singleShot(0, self._pump)
+
+    def _settle(self, request: tuple[str, str], ok: bool) -> None:
         kind, key = request
         if kind == APP:
             pids = self.policy.resolve(key, ok)
+            if ok:
+                _allow_foreground(pids)
             for pid in pids:
                 (_resume if ok else _kill)(pid)
             log.info("%s %s (%d process%s)", "unlocked" if ok else "blocked", key, len(pids),
@@ -310,6 +346,7 @@ class GuardController(QObject):
         elif kind == LOCK:
             pids = self.locks.resolve(key)
             if ok:
+                _allow_foreground(pids)
                 self._unlock_then([key], lambda: [_resume(p) for p in pids])
             else:
                 for pid in pids:              # Windows refuses them the item on its own
@@ -317,7 +354,6 @@ class GuardController(QObject):
         elif kind == OPEN and ok:
             closed = [i for i in self.locks.covering(key) if not self.locks.is_open(i)]
             self._unlock_then(closed, lambda: self._open_item(key))
-        QTimer.singleShot(0, self._pump)
 
     def shutdown(self) -> None:
         """Fail closed on exit: held apps are terminated, every item is locked again."""

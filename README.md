@@ -5,7 +5,8 @@ Face unlock for Windows. Lock apps, files and folders behind your face, and (exp
 - **App Lock**: pick any `.exe`. It is frozen the instant it starts and released only after you are recognised.
 - **File & Folder Lock**: lock documents, photos or whole folders. Windows itself refuses every program, Explorer included, until your face unlocks them.
 - **Windows unlock**: a credential provider adds FaceGate as a sign-in option on the lock screen.
-- **Works with a cap, glasses or a mask**: measured below, not just claimed.
+- **Works with a cap, glasses, a mask, headphones or earbuds**: measured below, not just claimed.
+- **Starts with Windows, then sleeps**: it waits in the tray with the camera off and the models unloaded, using about 0.3% of one CPU core, until a protected app or file is opened.
 - **Anti-spoofing**: two networks reject photos and screens.
 - **Animated overlay in your colours**: seven palettes, some of them flowing gradients, or any colour you pick. Brackets shimmer while scanning, close into a ring with a tick on success, and shake on failure.
 - **Fast**: about 10 ms of compute per camera frame, including liveness, on the discrete GPU.
@@ -33,7 +34,7 @@ Treat it as a convenience lock that keeps family, colleagues and passers-by out.
 flowchart LR
     subgraph app["FaceGate.exe: your session, in the tray"]
         UI["Settings window<br/>and unlock overlay"]
-        Guard["App Lock<br/>process watcher, every 30 ms"]
+        Guard["App Lock<br/>process watcher, woken by new windows"]
         Locks["File & Folder Lock<br/>NTFS deny rule"]
     end
     subgraph logon["Lock screen"]
@@ -109,19 +110,25 @@ A sample is taken only when the face is at least 110 px wide, the head is turned
 
 ## Measured accuracy
 
-`tools/eval_lfw.py` runs the real pipeline (the C++ engine, FP16, on the GPU) over 7,105 photos of 3,180 people from [LFW](http://vis-www.cs.umass.edu/lfw/). It compares every photo with every other: 17,118 same-person and 50,456,802 different-person comparisons. Each photo is also tested with a synthetic mask and a synthetic cap painted on. The thresholds are not hand-picked: the tool searches for the best setting at a stated false-accept budget, here 1 in 1,000,000.
+`tools/eval_lfw.py` runs the real pipeline (the C++ engine, FP16, on the GPU) over 7,105 photos of 3,180 people from [LFW](http://vis-www.cs.umass.edu/lfw/). It compares every photo with every other: 17,118 same-person and 50,456,802 different-person comparisons. Each photo is also tested wearing four synthetic coverings: a mask, a cap, over-ear headphones and earbuds. The thresholds are not hand-picked: the tool searches for the best setting at a stated false-accept budget, here 1 in 1,000,000.
 
-| Setting | Clear face accepted | Masked face accepted | Capped face accepted | Stranger accepted |
-|---|---|---|---|---|
-| Default (mask unlock on) | 99.58% | 90.10% | 99.22% | 1 in ~1,150,000 (clear), 1 in ~2,300,000 (masked) |
-| Mask unlock off | 99.58% | 88.34% | 99.22% | 1 in ~1,150,000 |
+| Setting | Clear face | Mask | Cap | Headphones | Earbuds | Stranger accepted |
+|---|---|---|---|---|---|---|
+| Default (mask unlock on) | 99.58% | 90.12% | 99.19% | 99.52% | 99.58% | 1 in ~1,150,000 (clear), 1 in ~1,800,000 (masked) |
+| Mask unlock off | 99.58% | 88.53% | 99.19% | 99.52% | 99.58% | 1 in ~1,150,000 |
+
+**Headphones and earbuds need no retraining.**
+- **What was tested:** over-ear cups and band (a third with a boom mic reaching to the mouth), and earbuds of three kinds: with a stem, round true-wireless, and wired.
+- **The full pipeline sees them:** they are painted onto the photo through the face's landmarks, and the face is then detected again from scratch. It was found again in all 7,105 photos both times.
+- **They cost at most 0.06 points**, because they sit at the very edge of the crop the network reads.
+- **If yours still give you trouble,** use **Add Alternate Appearance** while wearing them. That is the per-person "training", and adaptive learning keeps it current.
 
 Some caveats:
 
 - **One reference photo:** the "accepted" figures compare against one photo, taken years apart and in a different place. FaceGate enrolls eleven samples across head poses, on the camera you unlock with, so real acceptance should be higher. That has not been measured.
 - **Mislabelled pairs:** LFW contains mislabelled people. 68 "different-person" pairs score above 0.50, which genuine strangers essentially never do, so they are left out of the stranger column. Counting them, the stranger rate is 1 in ~450,000.
 - **Bigger galleries:** a gallery of several samples gives a stranger several chances to match, so the per-attempt false-accept rate is higher than the per-comparison figure, by up to roughly the gallery size.
-- **Synthetic coverings:** the masks and caps are painted polygons. Real ones vary more.
+- **Synthetic coverings:** the masks, caps, headphones and earbuds are painted shapes. Real ones vary more.
 - **Anti-spoofing is unmeasured:** no spoof dataset was used. On this laptop a live face scored 0.87–0.95 against a 0.55 threshold.
 - **No accuracy cost from the C++ engine or FP16:** the Python FP32 reference measured 99.26% / 92.71% / 98.59% at the previous thresholds, and the C++ pipeline 99.28% / 92.77% / 98.50%.
 
@@ -145,6 +152,34 @@ What the research found (details in [docs/architecture.md](docs/architecture.md)
 - **FP16 recognizer:** 10.7 → 4.0 ms, with embeddings at cosine ≥ 0.99995 of FP32. A 384×640 detector input (the shape of a 16:9 frame) halves detection time.
 - **Idle threads:** ONNX Runtime's idle threads busy-wait by default and slow everything else down on a 16-core hybrid CPU, so the engine turns that off.
 - **ResNet-100 rejected:** a bigger recognizer was tested. It was worse at the 1-in-a-million operating point and needs twice the compute.
+
+### Waiting in the background
+
+FaceGate spends nearly all its time waiting, so waiting has been made almost free. The table below was measured in the tray with one app protected and one file locked:
+
+| In the tray, nothing happening | Before | Now |
+|---|---|---|
+| CPU | 3.7% of one core | 0.3% of one core |
+| Memory in use (working set) | 247 MB | 4 MB |
+| Memory committed (private) | 1,517 MB | 42 MB |
+| Threads | 53 | 7 |
+| GPU memory | 235 MB | 0 MB |
+
+How it got there:
+
+- **Windows wakes it instead of polling:** the watcher used to list every process 33 times a second. Now Windows reports each new window (a WinEvent hook), and the watcher sees the app 13–23 ms after it starts, before its window appears.
+  - A once-a-second check remains for programs that never open a window. That check is the remaining 0.3%.
+  - With nothing protected or locked, it does not look at processes at all.
+- **Models load on demand:** the engine loads when a scan starts or the settings window opens, while the camera is starting. It unloads after 10 idle minutes (`engine_idle_minutes` in `settings.json`; 0 keeps it loaded).
+  - Its four networks are now created and warmed up in parallel, so loading takes 0.7–1.0 s instead of 1.1–1.5 s.
+- **numpy is held to one thread:** its math library (OpenBLAS) started a thread per core and reserved about 750 MB at import. FaceGate's matrix work is a few hundred dot products.
+
+| From the trigger to the first checked frame | |
+|---|---|
+| Models loaded | 0.8–0.9 s |
+| Models unloaded (first scan after 10 idle minutes) | 1.3–1.5 s |
+
+**Released the moment you are recognised.** A protected app is resumed as soon as the match is confirmed, while the tick animation still plays, not after the overlay fades out. That is about 1.5 s sooner than before, more than the first scan after an idle unload costs.
 
 ## Get it
 
@@ -205,7 +240,19 @@ About a minute of every build is Nuitka's own analysis of the Python code, which
 | App Lock, File & Folder Lock, enrollment, themes | yes | yes |
 | Elevated features (lock-screen unlock, start with Windows, locking admin apps) | yes, after `Install-FaceGate.ps1` | **no** (see [Security notes](#security-notes)) |
 
-`Install-FaceGate.ps1` (in the folder) copies the build to Program Files and adds a Start Menu shortcut.
+`Install-FaceGate.ps1` (in the folder) does four things:
+- copies the build to Program Files;
+- adds a Start Menu shortcut;
+- sets FaceGate to **start with Windows**, for the account that ran the installer, even if you approve the UAC prompt with a different administrator account;
+- starts it in the tray straight away.
+
+Run it again to update. It stops FaceGate (and the lock-screen service, if that is on), replaces the files, and starts both again.
+
+```powershell
+.\Install-FaceGate.ps1                 # install or update, start with Windows
+.\Install-FaceGate.ps1 -NoAutostart    # install only; start it from the Start Menu yourself
+.\Install-FaceGate.ps1 -Uninstall      # remove it (add -RemoveData to delete your enrolled face too)
+```
 
 ### Or run from source
 
@@ -231,7 +278,7 @@ The C++ engine is used automatically once it is built. Otherwise the Python engi
 4. **Add Files… / Add Folder…** under Files & Folders: anything except programs.
 5. **Appearance**: pick the animation colours; **Preview** plays scanning, success and failure.
 
-Closing the window keeps FaceGate guarding from the system tray. The tray menu also has **Lock Files Now**.
+Closing the window keeps FaceGate guarding from the system tray. With **Start with Windows** on (the installer turns it on), you never need to open the window again. The tray menu also has **Lock Files Now**.
 
 | Setting | Effect |
 |---|---|
@@ -239,9 +286,10 @@ Closing the window keeps FaceGate guarding from the system tray. The tray menu a
 | Require a live face | Anti-spoofing check. Turning it off needs your face or password. |
 | Adaptive learning | Adds confident live matches to the gallery, so it follows a beard or new glasses. |
 | Lock protected apps | Master switch for App Lock. |
-| Start with Windows | A scheduled task that starts FaceGate elevated at sign-in, without a UAC prompt. |
+| Start with Windows | A scheduled task that starts FaceGate elevated at sign-in, without a UAC prompt. The installer turns it on. |
 | Appearance | Seven palettes (Classic, Ocean, Aurora, Sunset, Neon, Rainbow, Mono) or a custom colour. |
 | `relock_minutes` in `settings.json` | How long an unlocked file or folder stays open (default 5). |
+| `engine_idle_minutes` in `settings.json` | Unload the models after this many idle minutes, freeing about 600 MB of memory and 235 MB of GPU memory (default 10; 0 keeps them loaded). |
 
 These actions require your face or password first:
 - removing a protected app or a locked item;
@@ -260,7 +308,7 @@ sequenceDiagram
     G->>W: suspend it
     G->>O: "Unlock App"
     alt recognised
-        O-->>G: success
+        O-->>G: success (the tick animation is still playing)
         G->>W: resume. Trusted until its last instance exits, then 20 s of grace
     else failed or cancelled
         O-->>G: failure
@@ -378,6 +426,7 @@ Safeguards:
 | A locked item shows **Not found** | It was renamed or moved, and the lock went with it. Rename it back, or unlock it with the command above and add it again. |
 | Face unlock misbehaves at the lock screen | Choose **Sign-in options** and use your password or PIN. Windows does not load third-party credential providers in Safe Mode, so you can always boot there and switch the feature off, or delete `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{7B3C9F2E-5A41-4D8B-9E6C-2F1A8D4B6C73}`. |
 | "Face ID is paused" | Five failed scans in a row. Use your Windows password, or wait five minutes. |
+| FaceGate does not start when you sign in | Run `Install-FaceGate.ps1` again, or switch **Start with Windows** off and on. The task is *FaceGate\App* in Task Scheduler. The single-file build cannot start with Windows (see [Security notes](#security-notes)). |
 | Does the exe work on this PC? | `FaceGate.exe selftest --output report.json` |
 | Logs | `C:\ProgramData\FaceGate\logs` (`app-<user>.log`, `service.log`) |
 
@@ -396,7 +445,7 @@ The current limits come from the hardware, from what has not been measured yet, 
 | File & Folder Lock | Explorer shell extension, so double-clicking a locked *folder* prompts directly | Explorer navigation currently shows "access denied"; the right-click verb works around it. |
 | File & Folder Lock / App Lock | Lock again the moment Windows locks (session notifications) | Closes the remaining minutes of an unlocked item or an app's grace period. |
 | App Lock | Match apps by publisher signature or file hash instead of by path | A copied `.exe` is not locked today. |
-| App Lock | Kernel process-creation callback instead of 30 ms polling | Freezes before the first instruction runs; needs a signed driver. |
+| App Lock | Kernel process-creation callback instead of window events and a 1 s check | Freezes before the first instruction runs, windowless programs included; needs a signed driver. |
 | Windows integration | Validate the credential provider on real LogonUI; later a Windows Biometric Framework adapter, so FaceGate appears as a Windows Hello sensor | The lock-screen path is the least tested part. |
 | Templates | Seal templates with a TPM-bound key (Microsoft Platform Crypto Provider) | Copying the data folder to another account or PC becomes useless. |
 | Speed | Keep the camera stream warm while an unlock is likely, and add TensorRT (FP16/INT8) as an optional backend | First-frame camera latency (~0.75 s) dominates. TensorRT adds about 1 GB of runtime for a few milliseconds. |
@@ -442,9 +491,10 @@ Ports bind to localhost. Set `FACEGATE_API_KEY` to require an `X-API-Key` header
 credential_provider\build\Release\cp_test.exe credential_provider\build\Release\FaceGateCP_test.dll
 ```
 
-There are 113 tests:
+There are 120 tests:
 - **State machines** run against a fake engine.
-- **App Lock tests** freeze, release and kill real `ping.exe` processes.
+- **App Lock tests** freeze, release and kill real `ping.exe` processes. They also check that a protected app runs again the moment you are recognised, and that the watcher does no work while nothing is protected and is woken by a new window without polling.
+- **Background tests** check that the engine unloads only when nothing uses it, and loads again for the next scan.
 - **Lock tests** set real NTFS permissions on temporary files and drive a real `cmd` process through the frozen, challenged, then allowed or refused cycle.
 - **Native tests** compare the C++ engine with the Python reference on real photographs: detection, alignment, both embedding views, liveness, template interchangeability, concurrent callers and hostile input. They are skipped when the engine, the models or LFW are absent.
 

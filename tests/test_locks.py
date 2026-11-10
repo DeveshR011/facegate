@@ -156,12 +156,14 @@ def test_lock_and_unlock_a_folder_and_a_file(tmp_path):
 # ---- the guard, end to end with a real process ------------------------------------------
 
 @pytest.fixture
-def lock_env(tmp_path):
+def lock_env(tmp_path, monkeypatch):
     pytest.importorskip("PySide6")
     from PySide6.QtCore import QCoreApplication
 
     from facegate.ui.guard_controller import GuardController
     from test_ui import FakeContext, FakeOverlay, pump
+
+    monkeypatch.setattr(GuardController, "poll_interval", 0.03)    # the reader opens no window
 
     secret = tmp_path / "secret.txt"
     secret.write_text("the eagle has landed")

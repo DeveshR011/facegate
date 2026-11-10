@@ -96,6 +96,35 @@ def test_masked_and_capped_faces_still_match_the_owner_only(engine, faces, tmp_p
             assert not decide(store.match(engine.embed_views(probe)), s)[0]
 
 
+def test_headphones_and_earbuds_still_match_the_owner_only(engine, faces, tmp_path):
+    from facegate.config import Settings
+    from facegate.core.auth import decide
+    from facegate.core.occlusion import crop_to_image, synth_earbuds, synth_headphones
+    from facegate.core.store import TemplateStore
+
+    s = Settings()
+    store = TemplateStore(tmp_path / "integration.bin")
+    store.add_appearance("Primary", [engine.embed_views(c) for _, _, c in faces["a"][:3]])
+    rng = np.random.default_rng(0)
+
+    def wearing(img, face, paint):
+        """Paint onto the photo, then detect and align again, as the camera loop would."""
+        photo = paint(img, rng, crop_to_image(face.kps))
+        centre = (face.bbox[:2] + face.bbox[2:]) / 2
+        found = engine.detect(photo)
+        assert found, "face lost once the occluder was on"
+        again = min(found, key=lambda f: np.linalg.norm((f.bbox[:2] + f.bbox[2:]) / 2 - centre))
+        return engine.embed_views(engine.align(photo, again))
+
+    for img, face, _ in faces["a"][3:]:
+        for paint in (synth_headphones, synth_earbuds):
+            matched, _, score = decide(store.match(wearing(img, face, paint)), s)
+            assert matched, f"owner with {paint.__name__} rejected (score {score:.3f})"
+    for img, face, _ in faces["b"]:
+        for paint in (synth_headphones, synth_earbuds):
+            assert not decide(store.match(wearing(img, face, paint)), s)[0]
+
+
 def test_embeddings_are_unit_length_and_deterministic(engine, faces):
     crop = faces["a"][0][2]
     first, second = engine.embed_views(crop), engine.embed_views(crop)

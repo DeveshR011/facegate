@@ -89,6 +89,9 @@ def _task_xml(description: str, trigger: str, principal: str, command: tuple[str
     <StartWhenAvailable>true</StartWhenAvailable>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Enabled>true</Enabled>
+    <!-- Tasks default to 7 (below normal CPU, I/O and memory priority), meant for batch jobs.
+         FaceGate has to freeze a protected app the moment it starts, and it is idle otherwise. -->
+    <Priority>4</Priority>
     {restart_xml}
   </Settings>
   <Actions Context="Author">

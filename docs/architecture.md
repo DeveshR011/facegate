@@ -6,7 +6,7 @@
 flowchart LR
     subgraph exe["FaceGate.exe  (Nuitka-compiled Python + Qt)"]
         UI["ui/<br/>overlay, enrollment, settings, themes"]
-        Guard["guard/<br/>process watcher + trust policy"]
+        Guard["guard/<br/>process watcher (window events)<br/>+ trust policy"]
         Locks["guard/locks.py<br/>file & folder lock"]
         Auth["core/auth.py<br/>state machines, decision rule"]
         Store["core/store.py<br/>DPAPI-sealed templates"]
@@ -59,7 +59,17 @@ The laptop has an Intel iGPU and the RTX 4050. DirectML's default happened to pi
 Left at defaults, idle worker threads busy-wait on a 16-core hybrid CPU and steal time from the caller (an unrelated OpenCV call ran 4× slower). The engine disables spinning and gives GPU sessions a single CPU thread. Measure engines in separate processes - one engine's leftover thread pools slow the next.
 
 ### 6. Thresholds are calibrated, not guessed
-`tools/eval_lfw.py` embeds every photo three ways (clean, synthetic mask, synthetic cap) through the real pipeline and searches thresholds for a stated false-accept budget: at 1 in 1,000,000 the whole-face threshold is 0.356. A second, "mask" view (lower face painted out, on both enrolled and probe side) is a second opinion for near-misses. A matching "cap" view was built and removed because it only added false accepts.
+`tools/eval_lfw.py` embeds every photo five ways through the real pipeline: clean, and wearing a synthetic mask, cap, over-ear headphones or earbuds. It then searches thresholds for a stated false-accept budget: at 1 in 1,000,000 the whole-face threshold is 0.356. A second, "mask" view (lower face painted out, on both enrolled and probe side) is a second opinion for near-misses. A matching "cap" view was built and removed because it only added false accepts.
+
+Headphones and earbuds are painted differently from masks and caps. Masks and caps go onto the aligned crop. Headphones and earbuds go onto the photo, through the inverse of the face's alignment, and the face is detected again. Ear cups at the edge of the face threaten the box and the landmarks more than the pixels they hide. The result:
+
+| Probe | Re-detected | Accepted at the shipped rule |
+|---|---|---|
+| Clean | – | 99.58% |
+| Over-ear headphones (35% with a boom mic) | 7,105 of 7,105 | 99.52% |
+| Earbuds (stem, round or wired) | 7,105 of 7,105 | 99.58% |
+
+The false-accept rate is unchanged. So the networks were not fine-tuned for headphones. That would chase 0.06 points while risking the calibrated 1e-6 operating point. An extra enrolled appearance covers the rest per person.
 
 ### 7. Two build products, because of privilege
 Code that runs elevated (the SYSTEM lock-screen service, the elevated autostart task, "Restart as Administrator") must not load from a folder ordinary programs can write to, or those programs could swap it and gain administrator rights.
@@ -125,6 +135,49 @@ DLLs cannot be vetoed from a plugin, so two trims stay as flags:
 - **`--noinclude-dlls=cv2/opencv_videoio_ffmpeg*.dll`** (29 MB). It decodes video files only; webcams use DirectShow or Media Foundation, which are compiled into `cv2.pyd`. `selftest` reports the camera backends, so a regression is visible.
 - **`--noinclude-qt-plugins=tls,imageformats,iconengines,styles`.** The app draws its own icons, uses the built-in Fusion style and loads no image files.
 
+### 10. In the background: woken by Windows, models loaded on demand
+The tray app runs all day and acts a few times a day, so its idle cost matters more than its frame time. Measured with one app protected and one file locked (offscreen harness, the real Qt event loop):
+
+| Idle in the tray | Before | Now |
+|---|---|---|
+| CPU | 3.7% of one core | 0.3% |
+| Working set / private memory | 247 / 1,517 MB | 4 / 42 MB |
+| Threads | 53 | 7 |
+| GPU memory | 235 MB | 0 MB |
+
+Each cost had its own cause:
+
+- **Process polling.** Listing processes (`EnumProcesses`) costs about 0.42 ms, and the watcher did it every 30 ms. It now registers an out-of-context WinEvent hook (`EVENT_OBJECT_CREATE`) on a thread of its own.
+  - A new app is reported 13–23 ms after it starts, before its window is visible.
+  - A 1 s backstop poll covers programs that never create a window. At about 1.8 ms per pass, it is all of the remaining 0.3%.
+  - With nothing protected, nothing locked and nothing tracked, the watcher is dormant: no enumeration at all.
+- **Models always loaded.** Inference needs about 600 MB of process memory and 235 MB of GPU memory, but only during a scan. The engine now loads on demand and unloads after `engine_idle_minutes` (default 10).
+  - Demand means a scan or the settings window. The camera opens while the engine loads, so the two overlap.
+  - It never unloads while a scan holds it (a refcount) or while the overlay or the window is visible.
+  - After unloading, `EmptyWorkingSet` hands start-up's pages back to Windows.
+- **numpy's OpenBLAS.** At import it started a thread per core and committed about 750 MB of buffers. `facegate/__init__.py` sets `OPENBLAS_NUM_THREADS=1` before numpy is imported. FaceGate's matrix work is a few hundred 512-d dot products per frame.
+
+### 11. Scan start-up: parallel sessions, early release
+With the models unloaded, a scan pays for engine creation, so `fg_create` was made concurrent:
+- the four ONNX Runtime sessions are created in parallel (`std::async`);
+- detection and embedding are warmed up on two threads while liveness warms up on the caller's;
+- the error string and scratch buffers are thread-local, and each network has its own lock.
+
+Engine creation went from 1.1–1.5 s to 0.7–1.0 s. Trigger-to-first-checked-frame is 1.3–1.5 s with the models unloaded and 0.8–0.9 s with them loaded; the camera's first frame dominates both.
+
+The bigger, felt gain is downstream. The overlay emits `succeeded` the moment identity is confirmed, and the guard resumes the app then (with `AllowSetForegroundWindow`), not after the 1.5 s tick animation and fade. The `completed` signal that follows does not act a second time.
+
+### 12. Start with Windows: a sign-in task, registered by the installer
+A Run key cannot start a program elevated without a UAC prompt, and FaceGate needs elevation to freeze apps that run as administrator. The app already had an elevated sign-in task (`FaceGate\App`, `--tray`, `HighestAvailable`), and `Install-FaceGate.ps1` now registers it and starts it.
+
+| Detail | Why |
+|---|---|
+| The non-elevated script passes its own account (`-ForUser`) to the elevated copy | Approving UAC with a different administrator account must not register the task for that account |
+| `<Priority>4</Priority>` in the task | Task Scheduler's default of 7 is below-normal CPU, I/O and memory priority, meant for batch jobs. FaceGate must freeze a new app at once; idle, priority costs nothing. Verified by registering the XML and reading the priority back. |
+| `robocopy /MIR /XF <installed FaceGateCP.dll>` | The mirror would otherwise delete the lock-screen DLL that `unlock-install` placed beside the exe |
+| `/R:2 /W:1` | A file in use fails the install in seconds, not after robocopy's default of a million 30-second retries |
+| Restart `FaceGate\UnlockService` after copying | Stopping FaceGate for the update also stopped the lock-screen service, which would otherwise stay down until a reboot |
+
 ## Failure behaviour
 - DLL, runtime or models missing → the Python engine is used (source installs), or the app reports it.
 - GPU session cannot be created → that model falls back to the CPU.
@@ -136,7 +189,10 @@ DLLs cannot be vetoed from a plugin, so two trims stay as flags:
 |---|---|
 | C++ engine equals the Python reference | `tests/test_native.py`: detection, alignment, both embedding views, liveness, template interchangeability, concurrency, hostile input |
 | The two engines are interchangeable | a template enrolled by one engine is matched by the other (cosine > 0.98 for the same photo) |
-| Accuracy | `tools/eval_lfw.py`: 17,118 same-person and 50,456,802 different-person comparisons |
+| Accuracy | `tools/eval_lfw.py`: 17,118 same-person and 50,456,802 different-person comparisons, clean and under four coverings |
+| Headphones and earbuds on real photos | `tests/test_integration.py`: painted onto LFW photos, re-detected; the owner still matches, another person never does |
+| Idle watcher | `tests/test_guard.py`: no process listing while nothing is protected; a new window wakes the watcher with a 60 s poll interval |
+| Engine on demand, early release | `tests/test_ui.py`: unloads only when idle (not in use, nothing visible), loads again on the next scan; a protected app runs again on `succeeded`, before the overlay closes |
 | Speed | `tools/bench_engine.py`: each engine in its own process, per-stage split, GPU utilisation |
 | Lock-screen component | `credential_provider/test/cp_test.cpp` plays LogonUI against a fake service |
 | File & folder lock | `tests/test_locks.py`: real deny rules on temporary files; a real `cmd` reader is frozen, challenged, then allowed or refused; relock on time-out and on quit |

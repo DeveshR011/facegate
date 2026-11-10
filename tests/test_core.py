@@ -13,7 +13,8 @@ from facegate.core.align import ARCFACE_DST, align_face, head_pose_proxy, simila
 from facegate.core.auth import decide
 from facegate.core.detector import _nms
 from facegate.core.limiter import AttemptLimiter
-from facegate.core.occlusion import VIEWS, synth_cap, synth_mask, view_of
+from facegate.core.occlusion import (VIEWS, crop_to_image, synth_cap, synth_earbuds, synth_headphones,
+                                     synth_mask, view_of)
 from facegate.core.store import MAX_ADAPTIVE, TemplateStore
 
 
@@ -79,6 +80,33 @@ def test_synthetic_occluders_change_the_expected_region():
     assert np.array_equal(mask[:55], crop[:55])
     assert np.abs(cap[:20].astype(int) - 200).mean() > 5
     assert np.array_equal(cap[45:], crop[45:])
+
+
+def test_headphones_and_earbuds_cover_the_ears_not_the_eyes():
+    crop = np.full((112, 112, 3), 200, dtype=np.uint8)
+    for seed in range(12):
+        phones = synth_headphones(crop, np.random.default_rng(seed))
+        buds = synth_earbuds(crop, np.random.default_rng(seed))
+        for out in (phones, buds):
+            assert np.array_equal(out[30:60, 24:88], crop[30:60, 24:88])     # eyes and brows untouched
+        assert (phones[55:70, :4] != 200).any() and (phones[55:70, -4:] != 200).any()   # both cups
+        assert (buds[55:75, :16] != 200).any() and (buds[55:75, -16:] != 200).any()     # both buds
+
+
+def test_occluders_follow_the_face_into_the_photo():
+    from facegate.core.align import ARCFACE_DST
+
+    # A face at twice the crop's scale, 40 px right and 30 px down in a larger photo.
+    kps = ARCFACE_DST * 2 + np.array([40, 30], dtype=np.float32)
+    to_image = crop_to_image(kps)
+    assert np.allclose(to_image, [[2, 0, 40], [0, 2, 30]], atol=1e-3)
+    photo = np.full((320, 320, 3), 200, dtype=np.uint8)
+    out = synth_headphones(photo, np.random.default_rng(0), to_image)
+    changed = np.argwhere((out != 200).any(axis=2))
+    # Cups at the crop's left and right edges land at x ~40 and ~264 in the photo; the eyes
+    # (crop y 52 -> photo y 133) stay clear between them.
+    assert changed[:, 1].min() < 50 and changed[:, 1].max() > 255
+    assert np.array_equal(out[100:150, 100:200], photo[100:150, 100:200])
 
 
 # ---- decision rule -------------------------------------------------------

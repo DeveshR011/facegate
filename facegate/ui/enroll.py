@@ -36,12 +36,16 @@ class EnrollWorker(QThread):
         self._stop = True
 
     def run(self) -> None:
-        engine = self.ctx.wait_engine()
-        if engine is None:
-            self.failed.emit(self.ctx.engine_error or "Recognition engine unavailable")
-            return
+        with self.ctx.engine_user():
+            self._run()
+
+    def _run(self) -> None:
         try:
-            with Camera(self.ctx.settings.camera_index) as cam:
+            with Camera(self.ctx.settings.camera_index) as cam:     # starts while the engine loads
+                engine = self.ctx.wait_engine()
+                if engine is None:
+                    self.failed.emit(self.ctx.engine_error or "Recognition engine unavailable")
+                    return
                 cam.warm_up()
                 session = EnrollSession(engine, self.ctx.settings, poses=self.poses)
                 while not self._stop:
@@ -215,6 +219,7 @@ class EnrollDialog(QDialog):
 
     def _begin(self) -> None:
         self.stack.setCurrentIndex(1)
+        self.ctx.load_engine()
         self._worker = EnrollWorker(self.ctx, self.poses, self)
         self._worker.frame.connect(self.ring.set_image)
         self._worker.update.connect(self._on_update)

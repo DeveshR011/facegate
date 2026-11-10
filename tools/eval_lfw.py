@@ -1,9 +1,12 @@
 """Calibrate thresholds and measure accuracy on LFW (Labeled Faces in the Wild).
 
-Every image is run through the real pipeline (detect -> align -> embed) three
-times: as-is, with a synthetic mask painted on, and with a synthetic cap.
-All-vs-all comparison then gives ~50 million impostor pairs, enough to read
-false-accept rates down to about 1e-6.
+Every image is run through the real pipeline (detect -> align -> embed) five
+times: as-is, with a synthetic mask, cap, over-ear headphones, or earbuds.
+Masks and caps are painted on the aligned crop. Headphones and earbuds are
+painted on the photo itself and the face is detected again, because what they
+put at risk is finding the face and its landmarks. All-vs-all comparison then
+gives ~50 million impostor pairs, enough to read false-accept rates down to
+about 1e-6.
 
     python tools/eval_lfw.py                 # download LFW, embed, report
     python tools/eval_lfw.py --max-per-id 6  # cap images per identity (default)
@@ -15,7 +18,7 @@ Reading the numbers
   They show up as "impostor" pairs with similarity above 0.5, which a correct
   impostor pair essentially never reaches. Rates are reported both raw and
   with those pairs excluded.
-* Masks and caps are synthetic (painted polygons). Real ones vary more.
+* The occluders are synthetic (painted shapes). Real ones vary more.
 """
 
 from __future__ import annotations
@@ -35,11 +38,13 @@ sys.path.insert(0, str(ROOT))
 
 from facegate.config import Settings  # noqa: E402
 from facegate.core.engine import create_engine  # noqa: E402
-from facegate.core.occlusion import VIEWS, synth_cap, synth_mask  # noqa: E402
+from facegate.core.occlusion import (VIEWS, crop_to_image, synth_cap, synth_earbuds,  # noqa: E402
+                                     synth_headphones, synth_mask)
 
 LFW_URL = "https://ndownloader.figshare.com/files/5976015"   # lfw-funneled.tgz
 CACHE = ROOT / ".cache"
-CONDITIONS = ("clean", "masked", "capped")
+CONDITIONS = ("clean", "masked", "capped", "headphones", "earbuds")
+IN_PHOTO = {"headphones": synth_headphones, "earbuds": synth_earbuds}   # painted before detection
 LABEL_NOISE = 0.50      # clean full-face similarity above which an "impostor" pair is a mislabel
 
 
@@ -78,23 +83,38 @@ def select_images(root: Path, max_per_id: int, singletons: int) -> tuple[list[Pa
     return paths, np.array(labels)
 
 
-def embed_all(paths: list[Path], engine) -> tuple[dict, np.ndarray]:
+def nearest_face(faces, point: np.ndarray):
+    return min(faces, key=lambda f: np.linalg.norm((f.bbox[:2] + f.bbox[2:]) / 2 - point), default=None)
+
+
+def embed_all(paths: list[Path], engine) -> tuple[dict, np.ndarray, dict]:
     rng = np.random.default_rng(7)
     feats = {c: {v: [] for v in VIEWS} for c in CONDITIONS}
+    missed = {c: 0 for c in IN_PHOTO}      # face no longer found once the occluder is on
     keep = []
     t0 = time.time()
     for i, path in enumerate(paths):
         img = cv2.imread(str(path))
-        faces = engine.detect(img)
-        if not faces:
-            continue
         # LFW centres the labelled person; ignore bystanders.
-        centre = np.array(img.shape[1::-1]) / 2
-        face = min(faces, key=lambda f: np.linalg.norm((f.bbox[:2] + f.bbox[2:]) / 2 - centre))
+        face = nearest_face(engine.detect(img), np.array(img.shape[1::-1]) / 2)
+        if face is None:
+            continue
         crop = engine.align(img, face)
         variants = {"clean": crop, "masked": synth_mask(crop, rng), "capped": synth_cap(crop, rng)}
+        centre, width = (face.bbox[:2] + face.bbox[2:]) / 2, face.bbox[2] - face.bbox[0]
+        for cond, paint in IN_PHOTO.items():
+            photo = paint(img, rng, crop_to_image(face.kps))
+            again = nearest_face(engine.detect(photo), centre)
+            if again is None or np.linalg.norm((again.bbox[:2] + again.bbox[2:]) / 2 - centre) > width / 4:
+                missed[cond] += 1
+                variants[cond] = None
+            else:
+                variants[cond] = engine.align(photo, again)
         for cond in CONDITIONS:
-            emb = engine.embed_views(variants[cond], VIEWS, flip=True)
+            if variants[cond] is None:          # a miss can never match: an all-zero embedding
+                emb = {v: np.zeros_like(feats["clean"][v][-1]) for v in VIEWS}
+            else:
+                emb = engine.embed_views(variants[cond], VIEWS, flip=True)
             for v in VIEWS:
                 feats[cond][v].append(emb[v])
         keep.append(i)
@@ -102,7 +122,7 @@ def embed_all(paths: list[Path], engine) -> tuple[dict, np.ndarray]:
             rate = (i + 1) / (time.time() - t0)
             print(f"  {i + 1}/{len(paths)}  ({rate:.0f} img/s)", flush=True)
     out = {c: {v: np.stack(a) for v, a in d.items()} for c, d in feats.items()}
-    return out, np.array(keep)
+    return out, np.array(keep), missed
 
 
 def far_threshold(impostor: np.ndarray, far: float) -> float:
@@ -124,17 +144,18 @@ def main() -> int:
     paths, labels = select_images(root, args.max_per_id, args.singletons)
     engine = create_engine()
     kind = type(engine).__name__
-    cache = CACHE / f"lfw_emb_v3_{kind}_{args.max_per_id}_{args.singletons}.npz"
+    cache = CACHE / f"lfw_emb_v4_{kind}_{args.max_per_id}_{args.singletons}.npz"
 
     if cache.exists() and not args.no_cache:
         z = np.load(cache)
         feats = {c: {v: z[f"{c}_{v}"] for v in VIEWS} for c in CONDITIONS}
         labels = z["labels"]
+        missed = {c: int(z[f"missed_{c}"]) for c in IN_PHOTO}
     else:
         print(f"embedding {len(paths)} images with {kind} on {engine.provider}…", flush=True)
-        feats, keep = embed_all(paths, engine)
+        feats, keep, missed = embed_all(paths, engine)
         labels = labels[keep]
-        np.savez(cache, labels=labels,
+        np.savez(cache, labels=labels, **{f"missed_{c}": k for c, k in missed.items()},
                  **{f"{c}_{v}": a for c, d in feats.items() for v, a in d.items()})
 
     n = len(labels)
@@ -150,16 +171,17 @@ def main() -> int:
     print(f"\n{n} images, {len(np.unique(labels))} identities")
     print(f"{genuine.sum():,} genuine comparisons, {impostor.sum():,} impostor comparisons")
     print(f"{noise.sum()} impostor pairs score >= {LABEL_NOISE} on clean full faces "
-          f"(LFW label noise; excluded from the 'adjusted' columns)\n")
+          f"(LFW label noise; excluded from the 'adjusted' columns)")
+    for cond, k in missed.items():
+        print(f"{cond}: face not found again in {k} of {n} photos ({100 * k / n:.2f}%; counted as rejections)")
 
-    print("Whole-face view alone")
-    print(f"{'thr':>5s} | {'clean TAR':>9s} {'masked TAR':>10s} {'capped TAR':>10s} | "
-          f"{'FAR raw':>8s} {'FAR adjusted':>12s}")
+    print("\nWhole-face view alone (true-accept rate per probe condition)")
+    print(f"{'thr':>5s} | " + " ".join(f"{c:>10s}" for c in CONDITIONS) + f" | {'FAR raw':>8s} {'FAR adjusted':>12s}")
     for t in (0.28, 0.30, 0.32, 0.34, 0.36, 0.38, 0.40, 0.42, 0.45):
         tar = [100 * (S[(c, "full")][genuine] >= t).mean() for c in CONDITIONS]
         raw = (S[("clean", "full")][impostor] >= t).mean()
         adj = (S[("clean", "full")][clean_imp] >= t).mean()
-        print(f"{t:5.2f} | {tar[0]:8.2f}% {tar[1]:9.2f}% {tar[2]:9.2f}% | {raw:8.1e} {adj:12.1e}")
+        print(f"{t:5.2f} | " + " ".join(f"{x:9.2f}%" for x in tar) + f" | {raw:8.1e} {adj:12.1e}")
 
     for far in (1e-4, 1e-5):
         t = far_threshold(S[("clean", "full")][clean_imp], far)
@@ -169,14 +191,14 @@ def main() -> int:
         print(f"\n{title}")
         print(f"  match_threshold={s.match_threshold}  occlusion_floor={s.occlusion_floor}  "
               f"mask_threshold={s.mask_threshold}  occlusion_unlock={s.occlusion_unlock}")
-        print(f"  {'probe':7s} {'TAR':>8s} {'FAR raw':>9s} {'FAR adjusted':>13s} {'false accepts (adj.)':>21s}")
+        print(f"  {'probe':10s} {'TAR':>8s} {'FAR raw':>9s} {'FAR adjusted':>13s} {'false accepts (adj.)':>21s}")
         for cond in CONDITIONS:
             full = S[(cond, "full")]
             accept = full >= s.match_threshold
             if s.occlusion_unlock:
                 accept |= (full >= s.occlusion_floor) & (S[(cond, "mask")] >= s.mask_threshold)
             fa = int(accept[clean_imp].sum())
-            print(f"  {cond:7s} {100 * accept[genuine].mean():7.2f}% {accept[impostor].mean():9.1e} "
+            print(f"  {cond:10s} {100 * accept[genuine].mean():7.2f}% {accept[impostor].mean():9.1e} "
                   f"{fa / clean_imp.sum():13.1e} {fa:>21d}")
 
     defaults = Settings()

@@ -87,6 +87,9 @@ class Settings:
     lockout_s: int = 300
     adaptive_learning: bool = True
     tta_flip: bool = True              # average the embedding with its mirror image
+    # The models hold ~250 MB of GPU memory. Unload them after this many idle minutes; they load
+    # again (about a second, overlapped with the camera starting) on the next scan. 0 = never.
+    engine_idle_minutes: int = 10
 
     # --- app guard ---
     guard_enabled: bool = True

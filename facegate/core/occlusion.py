@@ -48,8 +48,8 @@ def view_of(crop_bgr: np.ndarray, view: str) -> np.ndarray:
 
 # --------------------------------------------------------------------------
 # Synthetic occluders. Used only by the evaluation tool and the tests, to
-# measure how the views hold up against masks and caps the normalisation
-# polygons were *not* derived from.
+# measure how the views hold up against masks, caps, headphones and earbuds
+# the normalisation polygons were *not* derived from.
 # --------------------------------------------------------------------------
 
 _MASK_COLOURS = [(214, 176, 120), (235, 235, 235), (32, 32, 32), (120, 130, 60), (80, 60, 160)]
@@ -92,3 +92,90 @@ def synth_cap(crop_bgr: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         shade = tuple(int(max(0, c - 30)) for c in colour)
         cv2.ellipse(out, (56, brim + 1), (52, 5), 0, 0, 180, shade, -1, cv2.LINE_AA)
     return cv2.GaussianBlur(out, (3, 3), 0)
+
+
+# Headphones and earbuds sit at the edge of the face, where they can move the detected box and
+# landmarks as much as they hide skin. So they are drawn in crop coordinates (ears at x ~0-12 and
+# ~100-112, ear canal at about nose-tip height) but painted onto the whole photo, through the
+# crop -> photo transform of the face's landmarks, and the face is then detected again.
+
+_HEADPHONE_COLOURS = [(25, 25, 25), (225, 225, 225), (160, 160, 165), (40, 60, 90), (110, 40, 60)]
+_EARBUD_COLOURS = [(245, 245, 245), (30, 30, 30), (150, 150, 150), (140, 170, 200)]
+
+
+def crop_to_image(kps: np.ndarray) -> np.ndarray:
+    """2x3 transform from canonical crop coordinates to the photo the landmarks came from."""
+    from .align import ARCFACE_DST, similarity_transform
+
+    return cv2.invertAffineTransform(similarity_transform(kps, ARCFACE_DST))
+
+
+def _placer(to_image: np.ndarray | None):
+    """(points in crop coordinates -> int32 photo points, pixels per crop unit)."""
+    m = np.asarray(to_image if to_image is not None else [[1, 0, 0], [0, 1, 0]], dtype=np.float64)
+    scale = float(np.sqrt(abs(np.linalg.det(m[:, :2]))))
+
+    def place(points) -> np.ndarray:
+        pts = np.asarray(points, dtype=np.float64)
+        return np.round(pts @ m[:, :2].T + m[:, 2]).astype(np.int32)
+
+    return place, scale
+
+
+def _ellipse(cx: float, cy: float, rx: float, ry: float, start: float = 0, end: float = 360) -> np.ndarray:
+    t = np.radians(np.linspace(start, end, 48))
+    return np.stack([cx + rx * np.cos(t), cy + ry * np.sin(t)], axis=1)
+
+
+def _curve(a, ctrl, b) -> np.ndarray:
+    """Quadratic Bezier from a to b, bent towards ctrl."""
+    t = np.linspace(0, 1, 24)[:, None]
+    return (1 - t) ** 2 * np.asarray(a) + 2 * (1 - t) * t * np.asarray(ctrl) + t ** 2 * np.asarray(b)
+
+
+def synth_headphones(image_bgr: np.ndarray, rng: np.random.Generator,
+                     to_image: np.ndarray | None = None) -> np.ndarray:
+    """Over-ear headphones: a cup on each ear, the band over the head, and on some a boom mic."""
+    out = image_bgr.copy()
+    place, scale = _placer(to_image)
+    colour = _HEADPHONE_COLOURS[int(rng.integers(len(_HEADPHONE_COLOURS)))]
+    pad = tuple(int(max(0, c - 35)) for c in colour)
+    inset = rng.uniform(-2, 6)                  # cup centre, from the crop edge
+    cy, rx, ry = rng.uniform(58, 68), rng.uniform(8, 13), rng.uniform(18, 25)
+    for cx in (inset, 112 - inset):
+        cup = place(_ellipse(cx, cy, rx, ry))
+        cv2.fillPoly(out, [cup], colour, cv2.LINE_AA)
+        cv2.polylines(out, [cup], True, pad, max(1, round(2 * scale)), cv2.LINE_AA)   # ear cushion
+    # The band rises from the top of the cups, past the temples, over the top of the head.
+    band = _ellipse(56, cy - ry + 4, 56 - inset, rng.uniform(65, 80), 180, 360)
+    cv2.polylines(out, [place(band)], False, colour, max(1, round(rng.uniform(5, 9) * scale)), cv2.LINE_AA)
+    if rng.random() < 0.35:                     # gaming headset: boom mic from a cup to the mouth
+        side = 1 if rng.random() < 0.5 else -1
+        root = (56 - side * (56 - inset), cy + 0.5 * ry)
+        tip = (56 - side * rng.uniform(16, 24), rng.uniform(90, 100))
+        boom = _curve(root, (root[0] + side * 6, tip[1] + 4), tip)
+        cv2.polylines(out, [place(boom)], False, colour, max(1, round(rng.uniform(3, 5) * scale)), cv2.LINE_AA)
+        cv2.fillPoly(out, [place(_ellipse(*tip, 5, 4))], pad, cv2.LINE_AA)
+    return out
+
+
+def synth_earbuds(image_bgr: np.ndarray, rng: np.random.Generator,
+                  to_image: np.ndarray | None = None) -> np.ndarray:
+    """Earbuds in both ears: true-wireless with a stem, round true-wireless, or wired earphones."""
+    out = image_bgr.copy()
+    place, scale = _placer(to_image)
+    colour = _EARBUD_COLOURS[int(rng.integers(len(_EARBUD_COLOURS)))]
+    shade = tuple(int(max(0, c - 40)) for c in colour)
+    kind = ("stem", "round", "wired")[int(rng.integers(3))]
+    for side in (-1, 1):                        # -1: left of the image, +1: right
+        x, y = 56 + side * rng.uniform(44, 50), rng.uniform(60, 68)
+        r = rng.uniform(3.5, 5.5)
+        if kind == "stem":
+            stem = [(x, y), (x + side * rng.uniform(0, 2), y + rng.uniform(13, 18))]
+            cv2.polylines(out, [place(stem)], False, colour, max(1, round(4 * scale)), cv2.LINE_AA)
+        elif kind == "wired":                   # down past the jaw and under the chin
+            wire = _curve((x, y), (x - side * 4, y + 34), (56 + side * rng.uniform(6, 16), 128))
+            cv2.polylines(out, [place(wire)], False, shade, max(1, round(1.5 * scale)), cv2.LINE_AA)
+        cv2.fillPoly(out, [place(_ellipse(x, y, r, r))], colour, cv2.LINE_AA)
+        cv2.polylines(out, [place(_ellipse(x, y, r, r))], True, shade, 1, cv2.LINE_AA)
+    return out

@@ -149,3 +149,15 @@ def get_engine(progress: ProgressFn | None = None, prefer: str | None = None):
         if _engine is None:
             _engine = create_engine(progress=progress, prefer=prefer)
         return _engine
+
+
+def release_engine(engine) -> None:
+    """Free `engine` (GPU memory, model weights). If it is the process-wide one, the next
+    get_engine() loads a fresh one. The caller guarantees nothing is using it."""
+    global _engine
+    with _engine_lock:
+        if engine is _engine:
+            _engine = None
+    close = getattr(engine, "close", None)
+    if close is not None:
+        close()

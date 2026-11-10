@@ -9,7 +9,7 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPainterPath, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
@@ -172,9 +172,15 @@ def run(argv: list[str]) -> int:
         server.close()
 
     app.aboutToQuit.connect(cleanup)
-    ctx.load_engine()
+    # The engine loads when something needs it (a scan, or this window, see MainWindow.showEvent)
+    # and is unloaded again after a while, so FaceGate waiting in the tray is nearly free.
+    ctx.busy = lambda: overlay.active or window.isVisible()
     if not start_hidden:
         show_window()
+    else:
+        from ..win.system import trim_working_set
+
+        QTimer.singleShot(5000, trim_working_set)        # start-up's memory is not needed again
     if open_path:
         open_locked(open_path)
     log.info("started (hidden=%s)", start_hidden)
