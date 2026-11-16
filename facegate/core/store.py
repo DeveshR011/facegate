@@ -24,7 +24,7 @@ from .occlusion import VIEWS
 _MAGIC = b"FGT1"
 _PLAIN, _DPAPI = 0, 1
 DIM = 512
-MAX_ADAPTIVE = 12
+MAX_ADAPTIVE = 24          # learned samples kept; the oldest goes first
 
 Sample = dict[str, np.ndarray]   # view -> (512,) unit vector
 
@@ -141,10 +141,21 @@ class TemplateStore:
             self._gallery = None
             self.save()
 
+    @property
+    def learned_count(self) -> int:
+        return int(self.adaptive["full"].shape[0])
+
+    def forget_learned(self) -> None:
+        """Drop every learned sample; matching falls back to the enrolled appearances."""
+        with self._lock:
+            self.adaptive, self._gallery = _empty(), None
+            if self.appearances:
+                self.save()
+
     def add_adaptive(self, sample: Sample) -> bool:
-        """Remember a confidently matched live sample so the gallery follows
-        gradual changes (beard, glasses, ageing). Near-duplicates are skipped
-        and the pool is a bounded FIFO."""
+        """Remember a live sample of the owner so the gallery follows changes (hair, glasses,
+        beard, ageing). The caller decides what is worth learning (core.auth); near-duplicates
+        are skipped here and the pool is a bounded FIFO."""
         with self._lock:
             pool = self.adaptive["full"]
             if pool.shape[0] and float((pool @ sample["full"]).max()) > 0.80:
@@ -180,3 +191,11 @@ class TemplateStore:
             v: float((g[v] @ probe[v]).max()) if v in probe and g[v].shape[0] else -1.0
             for v in VIEWS
         }
+
+    def enrolled_score(self, probe: Sample) -> float:
+        """Best whole-face similarity to the enrolled appearances alone, ignoring what was learned
+        (-1 when nothing is enrolled). Learned samples sit after the enrolled ones in the gallery."""
+        with self._lock:
+            n = sum(a.count for a in self.appearances)
+            g = self.gallery()["full"][:n]
+        return float((g @ probe["full"]).max()) if n else -1.0

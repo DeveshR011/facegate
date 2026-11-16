@@ -5,6 +5,7 @@ from __future__ import annotations
 import getpass
 import logging
 import sys
+import threading
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -60,18 +61,38 @@ def _signal_running_instance(message: bytes = b"show") -> bool:
 
 
 def _setup_logging() -> None:
+    handler: logging.Handler = logging.StreamHandler()
     try:
         log_dir = data_dir() / "logs"
         log_dir.mkdir(exist_ok=True)
-        handler: logging.Handler = RotatingFileHandler(
-            log_dir / f"app-{getpass.getuser()}.log", maxBytes=512_000, backupCount=2, encoding="utf-8")
-    except OSError:
-        handler = logging.StreamHandler()
+        try:
+            user = getpass.getuser()
+        except Exception:               # no USERNAME in the environment (getpass then wants pwd)
+            user = "unknown"
+        handler = RotatingFileHandler(log_dir / f"app-{user}.log", maxBytes=512_000, backupCount=2,
+                                      encoding="utf-8")
+    except Exception:                   # logging must never be the reason FaceGate fails to start
+        pass
     logging.basicConfig(level=logging.INFO, handlers=[handler],
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # The exe has no console, and at sign-in nobody is watching: an error that escapes, on
+    # start-up or in the watcher's threads (which would silently end App Lock), goes to the log.
+    sys.excepthook = lambda kind, value, tb: log.critical("uncaught exception", exc_info=(kind, value, tb))
+    threading.excepthook = lambda a: log.critical(
+        "uncaught exception in thread %s", a.thread.name if a.thread else "?",
+        exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
 
 
 def run(argv: list[str]) -> int:
+    _setup_logging()
+    try:
+        return _run(argv)
+    except Exception:
+        log.exception("FaceGate stopped: %s", " ".join(argv))
+        raise
+
+
+def _run(argv: list[str]) -> int:
     start_hidden = "--tray" in argv
     takeover = "--takeover" in argv
     at = argv.index("--open") + 1 if "--open" in argv else 0
@@ -93,7 +114,6 @@ def run(argv: list[str]) -> int:
     elif _signal_running_instance(b"open\n" + open_path.encode("utf-8") if open_path else b"show"):
         return 0
 
-    _setup_logging()
     QLocalServer.removeServer(_server_name())
     server = QLocalServer()
     server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)

@@ -13,7 +13,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -374,27 +373,17 @@ fg_engine* fg_create(const fg_config* cfg) {
     const bool want_gpu = cfg->force_cpu == 0;
     if (want_gpu) e->gpu = describe_high_performance_gpu();
 
-    // The four sessions are independent; creating them one after another left the CPU mostly
-    // idle while each was optimised and handed to DirectML. Build them side by side. (A
-    // std::async future joins in its destructor, so an exception from one still waits for all.)
+    // One session at a time, and below one warm-up at a time. Building them on four threads saved
+    // about half a second, but it put the GPU driver's device setup on several threads at once:
+    // after a power-source change a load hung and the process died with heap corruption (0xC0000374).
     auto make = [&](const wchar_t* path, const char* what) {
-        return std::async(std::launch::async, [&e, path, what, want_gpu, cfg] {
-            return std::make_unique<Net>(e->env, path, want_gpu, cfg->cpu_threads, what);
-        });
+        return std::make_unique<Net>(e->env, path, want_gpu, cfg->cpu_threads, what);
     };
-    const bool with_liveness = cfg->liveness_a && cfg->liveness_b;
-    auto det_f = make(cfg->detector, "detector");
-    auto rec_f = make(cfg->recognizer, "recognizer");
-    std::future<std::unique_ptr<Net>> live_a_f, live_b_f;
-    if (with_liveness) {
-        live_a_f = make(cfg->liveness_a, "liveness A");
-        live_b_f = make(cfg->liveness_b, "liveness B");
-    }
-    e->det = det_f.get();
-    e->rec = rec_f.get();
-    if (with_liveness) {
-        e->live_a = live_a_f.get();
-        e->live_b = live_b_f.get();
+    e->det = make(cfg->detector, "detector");
+    e->rec = make(cfg->recognizer, "recognizer");
+    if (cfg->liveness_a && cfg->liveness_b) {
+        e->live_a = make(cfg->liveness_a, "liveness A");
+        e->live_b = make(cfg->liveness_b, "liveness B");
     }
 
     const auto& ds = e->det->shape();
@@ -412,27 +401,21 @@ fg_engine* fg_create(const fg_config* cfg) {
     e->provider = e->rec->gpu() ? "DmlExecutionProvider" : "CPUExecutionProvider";
     if (!e->rec->gpu()) { e->gpu.name = "cpu"; e->gpu.vram_mb = 0; }
 
-    // The first run of a DirectML graph compiles it; pay that now, not during an unlock. Each
-    // model has its own lock and the scratch buffers are per thread, so the three warm-ups
-    // (detector, recognizer, liveness pair) run side by side too.
+    // The first run of a DirectML graph compiles it; pay that now, not during an unlock.
     fg_engine* raw = e.get();
     std::vector<uint8_t> warm_img(static_cast<size_t>(3) * 480 * 640, 0);
-    auto warm_det = std::async(std::launch::async, [raw, &warm_img] {
-        fg_face faces[kMaxFaces];
-        detect_impl(raw, fg::Image{warm_img.data(), 640, 480, 640 * 3}, 1, faces);
-    });
-    auto warm_rec = std::async(std::launch::async, [raw] {
-        std::vector<uint8_t> crop(3 * FG_CROP * FG_CROP, 0);
-        std::vector<float> out(2 * FG_EMBED_DIM);
-        fg_embed(raw, crop.data(), FG_VIEW_FULL | FG_VIEW_MASK, 1, out.data());
-    });
+    fg_face faces[kMaxFaces];
+    detect_impl(raw, fg::Image{warm_img.data(), 640, 480, 640 * 3}, 1, faces);
+    std::vector<uint8_t> crop(3 * FG_CROP * FG_CROP, 0);
+    std::vector<float> out(2 * FG_EMBED_DIM);
+    if (fg_embed(raw, crop.data(), FG_VIEW_FULL | FG_VIEW_MASK, 1, out.data()) < 0)
+        throw std::runtime_error(g_error);
     if (raw->live_a) {
         const float box[4] = {200, 100, 400, 350};
         float p;
-        fg_liveness(raw, warm_img.data(), 640, 480, 640 * 3, box, &p);
+        if (fg_liveness(raw, warm_img.data(), 640, 480, 640 * 3, box, &p) < 0)
+            throw std::runtime_error(g_error);
     }
-    warm_det.get();
-    warm_rec.get();
     return e.release();
     FG_CATCH(nullptr)
 }

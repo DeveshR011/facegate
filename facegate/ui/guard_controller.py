@@ -10,15 +10,19 @@ Three kinds of request share one overlay, one at a time:
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import sys
+import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import psutil
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from ..config import data_dir
 from ..guard.locks import LockError, LockManager, LockOps
 from ..guard.policy import SYSTEM_CRITICAL, GuardPolicy, Verdict
 from ..guard.watcher import ProcessWatcher
@@ -81,6 +85,80 @@ def _open_with_shell(path: str) -> None:
         log.warning("could not open %s: %s", path, exc)
 
 
+class HeldRecord:
+    """The processes FaceGate is holding frozen, kept on disk.
+
+    If FaceGate dies while holding one, Windows leaves it suspended for good - and a frozen
+    browser also swallows every later launch of itself, which simply hangs. The next FaceGate
+    reads this record and finishes the job. A process is identified by pid and start time, so a
+    reused pid is never touched."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._held: dict[int, tuple[float, str]] = {}
+
+    def add(self, pid: int, kind: str) -> None:
+        try:
+            created = psutil.Process(pid).create_time()
+        except (psutil.Error, OSError):
+            return
+        with self._lock:
+            self._held = {p: v for p, v in self._held.items() if psutil.pid_exists(p)}
+            self._held[pid] = (created, kind)
+            self._write()
+
+    def remove(self, pid: int) -> None:
+        with self._lock:
+            if self._held.pop(pid, None) is not None:
+                self._write()
+
+    def _write(self) -> None:
+        try:
+            if self._held:
+                tmp = self.path.with_suffix(".tmp")
+                tmp.write_text(json.dumps({str(p): list(v) for p, v in self._held.items()}))
+                os.replace(tmp, self.path)
+            else:
+                self.path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not record held processes: %s", exc)
+
+    def recover(self) -> int:
+        """Finish what a FaceGate that stopped unexpectedly left frozen, failing closed: a
+        protected app is ended (the next launch is challenged as usual); a program held for a
+        locked item resumes, and Windows still refuses it the item. Returns how many."""
+        try:
+            entries = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return 0
+        except (OSError, ValueError) as exc:
+            log.warning("could not read held processes: %s", exc)
+            entries = {}
+        done = 0
+        for pid, entry in entries.items():
+            try:
+                created, kind = entry
+                proc = psutil.Process(int(pid))
+                if abs(proc.create_time() - created) > 1.0:
+                    continue                  # that process is gone and its pid was reused
+                if kind == APP:
+                    proc.kill()
+                else:
+                    proc.resume()
+                done += 1
+            except (psutil.Error, OSError, ValueError, TypeError):
+                continue
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if done:
+            log.warning("released %d process%s left frozen when FaceGate last stopped", done,
+                        "" if done == 1 else "es")
+        return done
+
+
 class GuardController(QObject):
     _challenge = Signal(str, str)      # (kind, key): watcher thread -> GUI thread
     _call = Signal(object)             # worker thread -> GUI thread: a callable to run
@@ -92,9 +170,11 @@ class GuardController(QObject):
     poll_interval = 1.0
 
     def __init__(self, ctx: AppContext, overlay: AuthOverlay, ops: LockOps | None = None,
-                 open_item=_open_with_shell):
+                 open_item=_open_with_shell, held: HeldRecord | None = None):
         super().__init__()
         self.ctx, self.overlay = ctx, overlay
+        self._held = held or HeldRecord(data_dir() / "held.json")
+        self._held.recover()                    # before the watcher adopts what is running
         self.policy = GuardPolicy(ctx.settings.grace_seconds)
         self.locks = LockManager()
         self.lock_errors: dict[str, str] = {}
@@ -139,7 +219,7 @@ class GuardController(QObject):
 
         for path in removed:                # no longer protected: release anything we hold
             for pid in self.policy.forget(path):
-                _resume(pid)
+                self._thaw(pid)
 
         new_items, gone_items = self.locks.configure(i.path for i in s.locked_items)
         if new_items:                       # newly added - or left open by a crash: lock now
@@ -147,7 +227,7 @@ class GuardController(QObject):
         if gone_items:
             for item in gone_items:
                 for pid in self.locks.resolve(item):
-                    _resume(pid)
+                    self._thaw(pid)
                 self.lock_errors.pop(item, None)
             self._background(self._ops.unlock, gone_items)
 
@@ -258,13 +338,29 @@ class GuardController(QObject):
 
         self._background(self._ops.unlock, items, done)
 
+    # ---- holding processes (any thread) -----------------------------------
+
+    def _freeze(self, pid: int, kind: str) -> bool:
+        if not _suspend(pid):
+            return False
+        self._held.add(pid, kind)
+        return True
+
+    def _thaw(self, pid: int) -> None:
+        _resume(pid)
+        self._held.remove(pid)
+
+    def _end(self, pid: int) -> None:
+        _kill(pid)
+        self._held.remove(pid)
+
     # ---- watcher thread --------------------------------------------------
 
     def _on_start(self, pid: int, path: str) -> None:
         verdict = self.policy.on_start(pid, path)
         if verdict is Verdict.ALLOW:
             return
-        if not _suspend(pid):
+        if not self._freeze(pid, APP):
             # Could not freeze it (exited, or more privileged than us): do not
             # leave a phantom entry that would block later launches.
             self.policy.on_exit(pid, path)
@@ -283,7 +379,7 @@ class GuardController(QObject):
         verdict = self.locks.on_access(pid, item)
         if verdict is Verdict.ALLOW:
             return
-        if not _suspend(pid):
+        if not self._freeze(pid, LOCK):
             self.locks.drop(pid, item)      # it will simply be refused access
             if not self.locks.has_pending(item):
                 return
@@ -340,17 +436,17 @@ class GuardController(QObject):
             if ok:
                 _allow_foreground(pids)
             for pid in pids:
-                (_resume if ok else _kill)(pid)
+                (self._thaw if ok else self._end)(pid)
             log.info("%s %s (%d process%s)", "unlocked" if ok else "blocked", key, len(pids),
                      "" if len(pids) == 1 else "es")
         elif kind == LOCK:
             pids = self.locks.resolve(key)
             if ok:
                 _allow_foreground(pids)
-                self._unlock_then([key], lambda: [_resume(p) for p in pids])
+                self._unlock_then([key], lambda: [self._thaw(p) for p in pids])
             else:
                 for pid in pids:              # Windows refuses them the item on its own
-                    _resume(pid)
+                    self._thaw(pid)
         elif kind == OPEN and ok:
             closed = [i for i in self.locks.covering(key) if not self.locks.is_open(i)]
             self._unlock_then(closed, lambda: self._open_item(key))
@@ -360,7 +456,7 @@ class GuardController(QObject):
         if self._watcher is not None:
             self._watcher.stop()
         for pid in self.policy.all_pending():
-            _kill(pid)
+            self._end(pid)
         self._relock_timer.stop()
         self._closed = True
         self._io.shutdown(wait=True)          # let queued lock/unlock calls finish, in order
@@ -371,4 +467,4 @@ class GuardController(QObject):
                 log.warning("could not lock %s on exit: %s", item, exc)
             self.locks.mark_locked(item)
         for pid in self.locks.all_pending():
-            _resume(pid)
+            self._thaw(pid)

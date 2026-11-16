@@ -20,9 +20,16 @@ if TYPE_CHECKING:
     from .engine import FaceEngine
 
 MIN_FACE_PX = 90           # narrower than this and the embedding is unreliable
-ADAPT_MARGIN = 0.15        # how far above threshold a match must be to be learned from
 NO_MATCH_FRAMES = 22       # clear face, wrong person -> give up
 SPOOF_FRAMES = 10          # matching face that never passes liveness -> give up
+
+# Adaptive learning: what a face must look like to be remembered.
+ADAPT_MARGIN = 0.05        # an unlock this far above the threshold is learned from...
+NOVEL_BELOW = 0.75         # ...unless a stored sample is already this close to it (nothing new)
+ANCHOR = 0.25              # anything learned must still resemble the enrolled face this much,
+                           # so learned looks cannot drift, one step at a time, to someone else
+LEARN_LIVENESS = 0.80      # and must look clearly live
+KEEP_NEAR_MISSES = 3       # near misses kept per scan, in case the password proves it was you
 
 
 class AuthState(str, Enum):
@@ -86,7 +93,12 @@ class AuthSession:
         self._match_total = 0
         self._no_match = 0
         self._saw_face = False
+        self._frames = 0
+        self._best = -1.0
         self.result: AuthUpdate | None = None
+        # (score, sample) of live faces that resembled you but missed the threshold, best first.
+        self.near_misses: list[tuple[float, Sample]] = []
+        self.learned = False
 
     def _finish(self, update: AuthUpdate) -> AuthUpdate:
         self.result = update
@@ -116,9 +128,12 @@ class AuthSession:
         views = VIEWS if self.s.occlusion_unlock else ("full",)
         probe = self.engine.embed_views(crop, views, flip=self.s.tta_flip)
         matched, view, score = decide(self.store.match(probe), self.s)
+        self._frames += 1
+        self._best = max(self._best, score)
 
         if not matched:
             self._no_match += 1
+            self._keep_near_miss(frame, face, score, probe)
             if self._no_match >= NO_MATCH_FRAMES:
                 return self._finish(AuthUpdate(AuthState.FAILED, "Face not recognised", score=score))
             return AuthUpdate(AuthState.MATCHING, "Hold still…", score=score)
@@ -145,18 +160,68 @@ class AuthSession:
         return AuthUpdate(AuthState.MATCHING, "Verifying…", score=score, liveness=mean_live,
                           view=view, progress=progress)
 
+    def _learnable(self, probe: Sample) -> bool:
+        return (self.s.adaptive_learning and all(v in probe for v in VIEWS)
+                and self.store.enrolled_score(probe) >= ANCHOR)
+
     def _maybe_learn(self, best: tuple[float, float, str, Sample]) -> None:
+        """Remember an unlock that shows a look the gallery covers only loosely, so it keeps up
+        with you - hair, glasses, beard, lighting - instead of only ever matching enrollment."""
         score, live, view, probe = best
-        if not self.s.adaptive_learning or view != "full":
+        if view != "full" or live < LEARN_LIVENESS:
             return
-        if score < self.s.match_threshold + ADAPT_MARGIN or live < 0.80:
+        if not self.s.match_threshold + ADAPT_MARGIN <= score < NOVEL_BELOW:
             return
-        if not all(v in probe for v in VIEWS):
+        if not self._learnable(probe):
             return
         try:
-            self.store.add_adaptive(probe)
+            self.learned = self.store.add_adaptive(probe)
         except OSError:
             pass    # learning is best-effort; never fail an unlock over it
+
+    def _keep_near_miss(self, frame: np.ndarray, face, score: float, probe: Sample) -> None:
+        """A face that resembles you but missed is kept (not learned) in case you then prove it
+        was you with your password - see `learn_after_password`."""
+        if not self._learnable(probe):
+            return
+        if len(self.near_misses) >= KEEP_NEAR_MISSES and score <= self.near_misses[-1][0]:
+            return
+        live = self.engine.liveness(frame, face) if self.s.require_liveness else 1.0
+        if live < LEARN_LIVENESS:
+            return
+        self.near_misses.append((score, probe))
+        self.near_misses.sort(key=lambda m: m[0], reverse=True)
+        del self.near_misses[KEEP_NEAR_MISSES:]
+
+    def summary(self) -> str:
+        """One log line: how the scan went, in numbers (never an image)."""
+        r = self.result
+        parts = [r.state.value if r else "running"]
+        parts.append(f"best score {self._best:.2f}" if self._saw_face else "no face seen")
+        parts.append(f"{self._frames} frame{'s' if self._frames != 1 else ''}")
+        if r is not None and r.liveness:
+            parts.append(f"liveness {r.liveness:.2f}")
+        if self.near_misses:
+            parts.append(f"{len(self.near_misses)} near miss{'es' if len(self.near_misses) > 1 else ''} kept")
+        if self.learned:
+            parts.append("learned this look")
+        return ", ".join(parts)
+
+
+def learn_after_password(store: TemplateStore, near_misses: list[tuple[float, Sample]],
+                         settings: Settings, limit: int = 2) -> int:
+    """You proved who you are with your password right after the face check missed you, and
+    said the face it saw was yours: remember it, so a sudden change (haircut, new glasses)
+    is recognised from the next scan on. Returns how many samples were added."""
+    if not settings.adaptive_learning:
+        return 0
+    added = 0
+    for _, probe in sorted(near_misses, key=lambda m: m[0], reverse=True)[:limit]:
+        try:
+            added += bool(store.add_adaptive(probe))
+        except OSError:
+            break
+    return added
 
 
 # --------------------------------------------------------------------------

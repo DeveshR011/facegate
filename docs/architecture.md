@@ -158,6 +158,8 @@ Each cost had its own cause:
 - **numpy's OpenBLAS.** At import it started a thread per core and committed about 750 MB of buffers. `facegate/__init__.py` sets `OPENBLAS_NUM_THREADS=1` before numpy is imported. FaceGate's matrix work is a few hundred 512-d dot products per frame.
 
 ### 11. Scan start-up: parallel sessions, early release
+*The parallel part is superseded by decision 13: the sessions are created one at a time again. The early release stands.*
+
 With the models unloaded, a scan pays for engine creation, so `fg_create` was made concurrent:
 - the four ONNX Runtime sessions are created in parallel (`std::async`);
 - detection and embedding are warmed up on two threads while liveness warms up on the caller's;
@@ -178,11 +180,36 @@ A Run key cannot start a program elevated without a UAC prompt, and FaceGate nee
 | `/R:2 /W:1` | A file in use fails the install in seconds, not after robocopy's default of a million 30-second retries |
 | Restart `FaceGate\UnlockService` after copying | Stopping FaceGate for the update also stopped the lock-screen service, which would otherwise stay down until a reboot |
 
+### 13. Never leave an app frozen: one-at-a-time loading, a bounded wait, restart after a crash
+**What happened (16 Nov).** The laptop's power source changed at 10:55. A Brave launch shortly after started an engine load that never finished: there was no "engine ready" log line. The overlay sat on "Starting up…" with no time limit. At 10:58:27 the challenge was given up (Brave killed), and four seconds later the process died in `ntdll` with heap corruption (`0xC0000374`). Nothing restarted it. The face matcher never ran, so the haircut and new glasses were never actually tested.
+
+The root cause inside the driver stack cannot be proven from one event. Each layer was changed so that the same failure cannot leave the user stuck again:
+
+| Layer | Change | Why |
+|---|---|---|
+| `fg_create` | Sessions are created and warmed up one at a time; warm-up errors fail the create (Python then falls back) | The parallel version had four threads setting up DirectML on the same GPU at once. Sequential timings: 1.14–1.24 s for the first load in a process, and 0.65–0.74 s for a reload in the same process, which is what the tray app does after an idle unload. That is no slower than the parallel 0.7–1.0 s. Neither 80 parallel nor 30 sequential create-detect-destroy rounds crashed, so the crash needs the morning's conditions as well. |
+| Scan | `AuthWorker` waits at most 15 s for the engine, checking for Cancel four times a second, then offers the password | The old wait was 60 s, could not be cancelled, and showed nothing new. The log now records how long each load took, and a warning when it overruns. |
+| Task | `FaceGate\App` gains an `EventTrigger` on *Application Error* 1000 whose `AppName` is the exe, delayed 10 s | Task Scheduler's restart-on-failure applies only when the task fails to *start*, not when the program later dies. The event trigger costs nothing while idle. A clean Quit logs no such event. It is added only for the compiled exe: from source the process is `pythonw.exe`, which other programs share. |
+| Guard | Every frozen process is written to `held.json` (pid and start time). The next FaceGate ends protected apps and resumes lock-held programs | Windows does not resume a suspended process when its suspender dies. A suspended browser also absorbs every later launch of itself, so the browser looks frozen for good. Matching on start time means a reused pid is never touched. |
+
+### 14. Learning that keeps up with sudden changes
+Adaptive learning used to keep only matches 0.15 above the threshold. A sudden change (a haircut and new glasses on the same day) that lowered your score to around the threshold was therefore never learned, and a change that pushed it below was never even seen.
+
+| Rule | Value | Reason |
+|---|---|---|
+| Learn an everyday unlock | score ≥ threshold + 0.05 and < 0.75, liveness ≥ 0.80 | Below 0.75 the gallery covers the look only loosely, which is what is worth keeping. Above it, nothing new is learned, which also limits churn. |
+| Anchor | similarity to the *enrolled* samples ≥ 0.25 | Matching uses learned samples, so without an anchor each learned look could carry the gallery a step further from the enrolled face. |
+| Near misses | up to 3 per challenge: live (≥ 0.80), anchored, below the threshold; kept in memory only | The raw material for the next row. |
+| After the password | "Remember how you look today?". Only on **Remember** are the best two added | The person typing the password is not necessarily the face the camera saw (a sibling, a friend looking on). The question costs one click, after the app has already been released. |
+| Pool | 24 samples, oldest first out, near-duplicates (> 0.80) skipped; **Forget** clears it | A bounded cost per match (a few dot products). The enrolled samples are never evicted. |
+
 ## Failure behaviour
 - DLL, runtime or models missing → the Python engine is used (source installs), or the app reports it.
 - GPU session cannot be created → that model falls back to the CPU.
 - Hostile or malformed coordinates, undersized buffers and mismatched model outputs are rejected with an error code, never followed.
 - Anything uncertain at the lock screen yields *no credential*; the password and PIN providers are untouched.
+- Engine still loading after 15 s → the scan offers the password; the load keeps going in the background.
+- FaceGate crashes → the sign-in task starts it again after 10 s; protected apps it held frozen are ended, programs held for a locked item resume (the deny rule still refuses them the item).
 
 ## Verification
 | What | How |
@@ -193,6 +220,8 @@ A Run key cannot start a program elevated without a UAC prompt, and FaceGate nee
 | Headphones and earbuds on real photos | `tests/test_integration.py`: painted onto LFW photos, re-detected; the owner still matches, another person never does |
 | Idle watcher | `tests/test_guard.py`: no process listing while nothing is protected; a new window wakes the watcher with a 60 s poll interval |
 | Engine on demand, early release | `tests/test_ui.py`: unloads only when idle (not in use, nothing visible), loads again on the next scan; a protected app runs again on `succeeded`, before the overlay closes |
+| Crash recovery | `tests/test_ui.py`: held pids are recorded until released; a record left by a "crashed" FaceGate ends the app, resumes the lock-held program and skips a reused pid; a stuck engine load is abandoned after the limit. `tests/test_core.py`: the task XML carries the crash trigger |
+| Learning | `tests/test_auth.py`: a changed look is kept as a near miss, learned after the password and then recognised; strangers, photos and drifted looks are not learned. The overlay's Remember / Esc / no-near-miss paths were driven off-screen |
 | Speed | `tools/bench_engine.py`: each engine in its own process, per-stage split, GPU utilisation |
 | Lock-screen component | `credential_provider/test/cp_test.cpp` plays LogonUI against a fake service |
 | File & folder lock | `tests/test_locks.py`: real deny rules on temporary files; a real `cmd` reader is frozen, challenged, then allowed or refused; relock on time-out and on quit |

@@ -2,32 +2,45 @@
 
 Flow:  scan -> success (tick, fade out)
             -> failure (shake) -> Try Again | Use Password | Cancel
+                                               -> correct, after a near miss:
+                                                  "Remember how you look today?" Remember | Not now
 """
 
 from __future__ import annotations
 
+import logging
 import sys
+import time
 
 from PySide6.QtCore import QEasingCurve, QEventLoop, QPropertyAnimation, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QPainter
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QStackedWidget, QVBoxLayout, QWidget)
 
-from ..core.auth import AuthSession, AuthState
+from ..core.auth import KEEP_NEAR_MISSES, AuthSession, AuthState, learn_after_password
 from ..core.camera import Camera, CameraError
 from .context import AppContext
 from .glyph import FaceGlyph, GlyphState
 from .palette import palette_for
 from .theme import TEXT_2, ui_font
 
+log = logging.getLogger(__name__)
+
+# How long a scan waits for the recognition engine to load before offering the password instead.
+# It normally loads in one to two seconds.
+ENGINE_WAIT_S = 15.0
+SLOW_ENGINE = "Face recognition is taking too long to start. Use your password, or try again."
+
 
 class AuthWorker(QThread):
     update = Signal(str, str, float)       # state, message, progress
     done = Signal(bool, str, str)          # ok, state, message
 
-    def __init__(self, ctx: AppContext, parent=None):
+    def __init__(self, ctx: AppContext, parent=None, engine_wait_s: float = ENGINE_WAIT_S):
         super().__init__(parent)
         self.ctx = ctx
+        self.engine_wait_s = engine_wait_s
+        self.session: AuthSession | None = None     # read by the overlay once `done` has fired
         self._stop = False
 
     def stop(self) -> None:
@@ -37,18 +50,33 @@ class AuthWorker(QThread):
         with self.ctx.engine_user():
             self._run()
 
+    def _wait_engine(self):
+        """The engine, or None if it failed, is still loading after `engine_wait_s`, or the
+        scan was cancelled. Checks for a cancel four times a second."""
+        deadline = time.monotonic() + self.engine_wait_s
+        while not self._stop:
+            engine = self.ctx.wait_engine(0.25)
+            if engine is not None or self.ctx.engine_error:
+                return engine
+            if time.monotonic() >= deadline:
+                log.warning("recognition engine still loading after %.0f s", self.engine_wait_s)
+                return None
+        return None
+
     def _run(self) -> None:
         self.ctx.store.refresh()
         try:
             # The camera starts while the engine loads (if it was asleep): both take most of a
             # second, so overlapping them hides most of the load.
             with Camera(self.ctx.settings.camera_index) as cam:
-                engine = self.ctx.wait_engine()
+                engine = self._wait_engine()
                 if engine is None:
-                    self.done.emit(False, "error", self.ctx.engine_error or "Recognition engine unavailable")
+                    if not self._stop:
+                        self.done.emit(False, "error", self.ctx.engine_error or SLOW_ENGINE)
                     return
                 cam.warm_up()
                 session = AuthSession(engine, self.ctx.store, self.ctx.settings)
+                self.session = session
                 while not self._stop:
                     frame = cam.read()
                     if frame is None:
@@ -56,6 +84,7 @@ class AuthWorker(QThread):
                         continue
                     u = session.feed(frame)
                     if u.done:
+                        log.info("scan: %s", session.summary())
                         if not self._stop:
                             self.done.emit(u.ok, u.state.value, u.message)
                         return
@@ -63,6 +92,7 @@ class AuthWorker(QThread):
         except CameraError as exc:
             self.done.emit(False, "error", str(exc))
         except Exception as exc:  # never leave the overlay hanging on an unexpected error
+            log.exception("scan failed")
             self.done.emit(False, "error", f"Unexpected error: {exc}")
 
 
@@ -76,6 +106,8 @@ class AuthOverlay(QWidget):
         self._worker: AuthWorker | None = None
         self._result: bool | None = None
         self._allow_password = True
+        self._confirmed = False                 # identity proven; nothing can make this a failure
+        self._near_misses: list = []            # from this challenge's failed scans, best first
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool)
@@ -154,6 +186,15 @@ class AuthOverlay(QWidget):
         pl.addWidget(self.password); pl.addLayout(row)
         self.stack.addWidget(pw)
 
+        # page 3: the password proved it was you right after a near miss - learn that face?
+        remember = QWidget()
+        rl = QHBoxLayout(remember); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(8)
+        not_now = QPushButton("Not now"); not_now.clicked.connect(lambda: self._finish(True))
+        self.remember = QPushButton("Remember"); self.remember.setObjectName("primary")
+        self.remember.clicked.connect(self._remember_look)
+        rl.addWidget(not_now); rl.addWidget(self.remember)
+        self.stack.addWidget(remember)
+
         self._fade = QPropertyAnimation(self, b"windowOpacity", self)
         self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._fade.finished.connect(self._fade_finished)
@@ -166,6 +207,8 @@ class AuthOverlay(QWidget):
 
     def start(self, title: str = "Face ID", allow_password: bool = True) -> None:
         self._result = None
+        self._confirmed = False
+        self._near_misses = []
         self._allow_password = allow_password and sys.platform == "win32"
         self.use_pw.setVisible(self._allow_password)
         self.title.setText(title)
@@ -249,8 +292,13 @@ class AuthOverlay(QWidget):
         self.status.setText(message)
 
     def _on_done(self, ok: bool, state: str, message: str) -> None:
+        session = self._worker.session if self._worker is not None else None
+        if not ok and session is not None and session.near_misses:
+            merged = self._near_misses + session.near_misses
+            self._near_misses = sorted(merged, key=lambda m: m[0], reverse=True)[:KEEP_NEAR_MISSES]
         self._stop_worker()
         if ok:
+            self._confirmed = True
             self.ctx.limiter.record_success()
             self.status.setText("")
             self.stack.setCurrentIndex(0)
@@ -298,24 +346,39 @@ class AuthOverlay(QWidget):
             self.unlock.setEnabled(True)
         self.password.clear()
         if ok:
+            self._confirmed = True
             self.ctx.limiter.record_success()
-            self.stack.setCurrentIndex(0)
             self.cancel_scan.setVisible(False)
-            self.status.setText("")
             self.glyph.set_state(GlyphState.SUCCESS)
-            self.succeeded.emit()
+            self.succeeded.emit()                 # release the app now; the question can wait
+            if self._near_misses and self.ctx.settings.adaptive_learning:
+                self.status.setText("Face ID didn't recognise you just now. "
+                                    "Remember how you look today?")
+                self.stack.setCurrentIndex(3)
+                self.remember.setFocus()
+                QTimer.singleShot(0, self._centre_card)
+            else:
+                self.status.setText("")
+                self.stack.setCurrentIndex(0)
         else:
             self.glyph.set_state(GlyphState.FAILURE)
             self.status.setText("Incorrect password")
 
+    def _remember_look(self) -> None:
+        added = learn_after_password(self.ctx.store, self._near_misses, self.ctx.settings)
+        log.info("remembered a new look after a password unlock (%d sample%s)", added,
+                 "" if added == 1 else "s")
+        self._near_misses = []
+        self._finish(True)
+
     def _glyph_finished(self, state) -> None:
-        if state is GlyphState.SUCCESS:
+        if state is GlyphState.SUCCESS and self.stack.currentIndex() != 3:
             QTimer.singleShot(260, lambda: self._finish(True))
 
     def _finish(self, ok: bool) -> None:
         if self._result is not None:
             return
-        self._result = ok
+        self._result = ok or self._confirmed     # Esc on the "remember" question is not a failure
         self._stop_worker()
         self._fade.stop()
         self._fade.setDuration(150)

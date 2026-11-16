@@ -99,7 +99,23 @@ flowchart LR
     C["Centre ×3"] --> Le["Left ×2"] --> Ri["Right ×2"] --> U["Up ×2"] --> Do["Down ×2"] --> St[("11 samples × 2 views<br/>sealed with DPAPI")]
 ```
 
-A sample is taken only when the face is at least 110 px wide, the head is turned the way the prompt asks, the crop is sharp, and the liveness check passes. **Adaptive learning** later adds up to 12 samples from confident live matches (score at least 0.15 above the threshold, liveness at least 0.80), so the gallery follows a new beard or glasses.
+A sample is taken only when the face is at least 110 px wide, the head is turned the way the prompt asks, the crop is sharp, and the liveness check passes.
+
+**Adaptive learning** keeps the gallery up to date as you change: hair, glasses, a beard, the light in a new room. It keeps up to 24 learned samples, dropping the oldest first, in two ways:
+
+- **From everyday unlocks.** It keeps an unlock that shows a look the gallery covers only loosely:
+  - the score is at least 0.05 above the threshold, but below 0.75 (a closer match teaches it nothing new);
+  - liveness is at least 0.80.
+- **After a sudden change.** Say you had a haircut and the scan misses you.
+  - While scanning, FaceGate keeps the closest live near misses in memory.
+  - If your password unlocks instead, it asks **"Remember how you look today?"**. Answer **Remember**, and the next scan recognises the new look.
+  - Nothing is learned without that answer, because the person typing the password is not always the face in front of the camera.
+
+Two rules apply to both:
+- **Anchored:** a learned sample must still resemble your *enrolled* face (similarity at least 0.25). A chain of learned looks therefore cannot drift, step by step, to someone else.
+- **Undoable:** **Learned looks → Forget** in the settings window removes every learned sample and keeps your enrollment.
+
+Every scan writes one line to the log, in numbers only: the outcome, best score, liveness, frames, and whether it learned anything.
 
 | Stage | Model | Purpose |
 |---|---|---|
@@ -171,7 +187,8 @@ How it got there:
   - A once-a-second check remains for programs that never open a window. That check is the remaining 0.3%.
   - With nothing protected or locked, it does not look at processes at all.
 - **Models load on demand:** the engine loads when a scan starts or the settings window opens, while the camera is starting. It unloads after 10 idle minutes (`engine_idle_minutes` in `settings.json`; 0 keeps it loaded).
-  - Its four networks are now created and warmed up in parallel, so loading takes 0.7–1.0 s instead of 1.1–1.5 s.
+  - Loading takes 0.65–0.75 s when the tray app reloads the engine after an idle unload, and 1.1–1.25 s the first time after FaceGate starts.
+  - Its four networks load one at a time. Loading them in parallel saved nothing measurable, and was the likely trigger of a crash ([architecture decision 13](docs/architecture.md#13-never-leave-an-app-frozen-one-at-a-time-loading-a-bounded-wait-restart-after-a-crash)).
 - **numpy is held to one thread:** its math library (OpenBLAS) started a thread per core and reserved about 750 MB at import. FaceGate's matrix work is a few hundred dot products.
 
 | From the trigger to the first checked frame | |
@@ -284,7 +301,8 @@ Closing the window keeps FaceGate guarding from the system tray. With **Start wi
 |---|---|
 | Unlock with a mask | Accepts a near miss when the eyes-and-brows view independently agrees. |
 | Require a live face | Anti-spoofing check. Turning it off needs your face or password. |
-| Adaptive learning | Adds confident live matches to the gallery, so it follows a beard or new glasses. |
+| Adaptive learning | Learns new looks from everyday unlocks. When a scan misses you and your password unlocks instead, it offers to remember that look (see [How it works](#how-it-works)). |
+| Learned looks → Forget | Removes everything learned and keeps your enrolled face. |
 | Lock protected apps | Master switch for App Lock. |
 | Start with Windows | A scheduled task that starts FaceGate elevated at sign-in, without a UAC prompt. The installer turns it on. |
 | Appearance | Seven palettes (Classic, Ocean, Aurora, Sunset, Neon, Rainbow, Mono) or a custom colour. |
@@ -426,6 +444,9 @@ Safeguards:
 | A locked item shows **Not found** | It was renamed or moved, and the lock went with it. Rename it back, or unlock it with the command above and add it again. |
 | Face unlock misbehaves at the lock screen | Choose **Sign-in options** and use your password or PIN. Windows does not load third-party credential providers in Safe Mode, so you can always boot there and switch the feature off, or delete `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{7B3C9F2E-5A41-4D8B-9E6C-2F1A8D4B6C73}`. |
 | "Face ID is paused" | Five failed scans in a row. Use your Windows password, or wait five minutes. |
+| It stopped recognising you (haircut, new glasses) | Choose **Use Password**, then **Remember** when asked. If it keeps missing you, use **Add Alternate Appearance**. The log shows each scan's best score. If that is far below 0.36, the camera view or the light is the problem, not the look. |
+| "Face recognition is taking too long to start" | The engine did not load within 15 s (it normally takes 1–2 s). Use your password. FaceGate keeps trying in the background, and the log says how long the engine took. |
+| FaceGate crashed | The installed build starts again about 10 s after Windows records the crash. Any app it was holding frozen at that moment is ended, so the next launch is challenged normally instead of hanging. The crash is in Event Viewer → Windows Logs → Application (*Application Error*, *FaceGate.exe*). |
 | FaceGate does not start when you sign in | Run `Install-FaceGate.ps1` again, or switch **Start with Windows** off and on. The task is *FaceGate\App* in Task Scheduler. The single-file build cannot start with Windows (see [Security notes](#security-notes)). |
 | Does the exe work on this PC? | `FaceGate.exe selftest --output report.json` |
 | Logs | `C:\ProgramData\FaceGate\logs` (`app-<user>.log`, `service.log`) |
@@ -439,7 +460,7 @@ The current limits come from the hardware, from what has not been measured yet, 
 | Anti-spoofing | Support Windows Hello IR cameras (infrared plus depth cues) | The biggest gap to Face ID. A 2-D RGB image cannot prove a face is three-dimensional. |
 | Anti-spoofing | Benchmark liveness on OULU-NPU, SiW or CelebA-Spoof and calibrate its threshold the way the match threshold was | Today's 0.55 is a sensible default, not a measured operating point. |
 | Anti-spoofing | Temporal liveness (blink and micro-motion across the frames already captured), or an optional "turn your head" challenge | Defeats printed photos and still screens cheaply. |
-| Accuracy | Measure false rejects on your own camera, with opt-in local score logs | LFW is a proxy; your lighting and camera are what count. |
+| Accuracy | Calibrate on your own camera from the per-scan scores now in the log | LFW is a proxy; your lighting and camera are what count. |
 | Accuracy | Fine-tune the mask view on real masked faces, not painted polygons | Masked acceptance (90%) is the weakest number. |
 | File & Folder Lock | Optional encrypted vault (AES-GCM, key released only after a match; or EFS) | Protects data from administrators and from offline access, which permissions cannot. |
 | File & Folder Lock | Explorer shell extension, so double-clicking a locked *folder* prompts directly | Explorer navigation currently shows "access denied"; the right-click verb works around it. |
@@ -491,10 +512,18 @@ Ports bind to localhost. Set `FACEGATE_API_KEY` to require an `X-API-Key` header
 credential_provider\build\Release\cp_test.exe credential_provider\build\Release\FaceGateCP_test.dll
 ```
 
-There are 120 tests:
-- **State machines** run against a fake engine.
-- **App Lock tests** freeze, release and kill real `ping.exe` processes. They also check that a protected app runs again the moment you are recognised, and that the watcher does no work while nothing is protected and is woken by a new window without polling.
-- **Background tests** check that the engine unloads only when nothing uses it, and loads again for the next scan.
+There are 131 tests:
+- **State machines** run against a fake engine. This includes adaptive learning:
+  - a changed look that misses is learned after the password and then recognised;
+  - strangers, photos and looks that drifted away from enrollment are never learned.
+- **App Lock tests** freeze, release and kill real `ping.exe` processes. They check that:
+  - a protected app runs again the moment you are recognised;
+  - the watcher does no work while nothing is protected, and is woken by a new window without polling;
+  - processes a crashed FaceGate left frozen are cleaned up by the next one, and a reused process id is left alone.
+- **Background tests** check that:
+  - the engine unloads only when nothing uses it, and loads again for the next scan;
+  - a scan stops waiting for an engine that will not load;
+  - the sign-in task also starts FaceGate again after a crash.
 - **Lock tests** set real NTFS permissions on temporary files and drive a real `cmd` process through the frozen, challenged, then allowed or refused cycle.
 - **Native tests** compare the C++ engine with the Python reference on real photographs: detection, alignment, both embedding views, liveness, template interchangeability, concurrent callers and hostile input. They are skipped when the engine, the models or LFW are absent.
 

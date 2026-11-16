@@ -98,6 +98,11 @@ def _selftest(argv: list[str]) -> int:
     # Webcams need DirectShow / Media Foundation, built into cv2 (the ffmpeg plugin is not shipped).
     report["camera_backends"] = [cv2.videoio_registry.getBackendName(b)
                                  for b in cv2.videoio_registry.getCameraBackends()]
+    if sys.platform == "win32":     # where elevated features look for, and accept, their own code
+        from .win import system
+
+        report["elevation"] = {"exe": system.current_exe(), "code": system.__file__,
+                               "allowed": system.elevation_safe()}
     text = json.dumps(report, indent=2)
     print(text)
     if option("--output"):          # a windowed build has no console to print to

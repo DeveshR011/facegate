@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from ctypes import POINTER, c_char, c_float, c_int32, c_uint64, c_void_p, c_wchar_p
 from pathlib import Path
 
@@ -157,7 +158,9 @@ class NativeEngine:
             liveness_b=str(model_dir / MODEL_FILES["liveness_b"]),
             force_cpu=int(force_cpu), cpu_threads=0, det_score=0.0, det_nms=0.0,
         )
+        t0 = time.perf_counter()
         self._h = self._lib.fg_create(ctypes.byref(cfg))
+        seconds = time.perf_counter() - t0
         if not self._h:
             raise NativeUnavailable(f"engine failed to start: {self._error()}")
         info = _Info()
@@ -166,7 +169,8 @@ class NativeEngine:
         self.adapter = info.adapter.decode()
         self.vram_mb = int(info.vram_mb)
         self.detector_size = (info.det_w, info.det_h)
-        log.info("C++ engine ready on %s (%s, %d MB)", self.provider, self.adapter, self.vram_mb)
+        log.info("C++ engine ready on %s (%s, %d MB) in %.1f s", self.provider, self.adapter,
+                 self.vram_mb, seconds)
 
     # ---- internals -------------------------------------------------------
 

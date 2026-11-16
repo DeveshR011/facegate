@@ -106,7 +106,8 @@ def _task_xml(description: str, trigger: str, principal: str, command: tuple[str
 
 
 def _schtasks(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["schtasks", *args], capture_output=True, text=True,
+    # stdin=DEVNULL: see locks._icacls (started at sign-in, the standard handles are invalid).
+    return subprocess.run(["schtasks", *args], capture_output=True, stdin=subprocess.DEVNULL, text=True,
                           creationflags=subprocess.CREATE_NO_WINDOW)
 
 
@@ -126,11 +127,25 @@ def task_exists(name: str) -> bool:
     return _schtasks("/Query", "/TN", name).returncode == 0
 
 
+def _crash_trigger(exe: str) -> str:
+    """Start again when Windows logs that the app crashed (Application Error 1000 names the
+    exe). Ten seconds' delay lets Windows Error Reporting finish with the old process. A normal
+    exit - Quit in the tray menu, signing out - logs no such event."""
+    query = ('<QueryList><Query Id="0" Path="Application"><Select Path="Application">'
+             "*[System[Provider[@Name='Application Error'] and EventID=1000]] and "
+             f"*[EventData[Data[@Name='AppName']='{Path(exe).name}']]"
+             "</Select></Query></QueryList>")
+    return (f"<EventTrigger><Enabled>true</Enabled><Subscription>{escape(query)}</Subscription>"
+            "<Delay>PT10S</Delay></EventTrigger>")
+
+
 def autostart_on(user: str) -> int:
     command = app_command(["--tray"])
     if _unsafe_for_elevation(command[0]):
         return EXIT_NOT_INSTALLED
     trigger = f"<LogonTrigger><Enabled>true</Enabled><UserId>{escape(user)}</UserId></LogonTrigger>"
+    if is_compiled():               # from source the exe is pythonw.exe, shared with other apps
+        trigger += _crash_trigger(command[0])
     principal = (f"<UserId>{escape(user)}</UserId><LogonType>InteractiveToken</LogonType>"
                  "<RunLevel>HighestAvailable</RunLevel>")
     _create_task(TASK_APP, _task_xml("FaceGate app lock (starts in the tray)", trigger, principal,
@@ -168,7 +183,7 @@ def _lock_down_data_dir(user: str) -> None:
     subprocess.run(
         ["icacls", str(data_dir()), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F",
          "*S-1-5-32-544:(OI)(CI)F", f"{user}:(OI)(CI)M", "/T", "/C", "/Q"],
-        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+        capture_output=True, stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
 

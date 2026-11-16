@@ -131,6 +131,21 @@ def readable(path) -> bool:
 
 
 @win
+def test_helpers_run_when_started_by_task_scheduler(tmp_path, monkeypatch):
+    """At sign-in, Task Scheduler starts the windowed app with invalid standard handles. A child
+    process that inherits them fails to start ("The handle is invalid"), which crashed FaceGate."""
+    from facegate.win import admin
+
+    monkeypatch.setattr(subprocess._winapi, "GetStdHandle", lambda which: 0xBAD0)   # junk, not None
+    item = tmp_path / "secret.txt"
+    item.write_text("x")
+    admin.task_exists(r"FaceGate\NoSuchTask")                    # schtasks
+    locks.lock(str(item))                                        # icacls
+    assert locks.is_locked(str(item))
+    locks.unlock(str(item))
+
+
+@win
 def test_lock_and_unlock_a_folder_and_a_file(tmp_path):
     folder, deep, file = tmp_path / "Private", tmp_path / "Private" / "sub" / "a.txt", tmp_path / "b.pdf"
     deep.parent.mkdir(parents=True)

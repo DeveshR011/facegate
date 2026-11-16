@@ -59,10 +59,18 @@ def in_protected_location(path: str) -> bool:
     """True when only administrators can modify `path` (Program Files or Windows).
 
     A process that runs elevated must not load code from a folder an ordinary process can
-    write to; otherwise that process could plant a DLL and gain administrator rights."""
-    p = os.path.normcase(os.path.abspath(path))
+    write to; otherwise that process could plant a DLL and gain administrator rights.
+
+    Paths are compared in canonical form. The compiled build sees its own code as
+    C:\\PROGRA~1\\FaceGate\\... (Nuitka stores its folder as an 8.3 short name), which a text
+    comparison with C:\\Program Files rejects; and a junction inside Program Files that leads
+    to a user-writable folder must count as that folder."""
+    def canonical(p: str) -> str:
+        return os.path.normcase(os.path.realpath(p))
+
+    p = canonical(path)
     roots = [os.environ.get(k) for k in ("ProgramFiles", "ProgramFiles(x86)", "SystemRoot")]
-    return any(r and p.startswith(os.path.normcase(os.path.abspath(r)) + os.sep) for r in roots)
+    return any(r and p.startswith(canonical(r) + os.sep) for r in roots)
 
 
 class _ShellExecuteInfo(ctypes.Structure):

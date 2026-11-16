@@ -194,6 +194,22 @@ def test_adaptive_pool_skips_duplicates_and_is_bounded(tmp_path):
     assert store.gallery()["full"].shape[0] == 1 + MAX_ADAPTIVE
 
 
+def test_learned_samples_can_be_forgotten_and_never_count_as_enrollment(tmp_path):
+    path = tmp_path / "t.bin"
+    owner, learned = sample(1), sample(60)
+    store = TemplateStore(path)
+    store.add_appearance("Primary", [owner])
+    store.add_adaptive(learned)
+    assert store.match(learned)["full"] > 0.99                 # matching uses what was learned
+    assert store.enrolled_score(learned) < 0.2                 # the anchor ignores it
+    assert abs(store.enrolled_score(owner) - 1.0) < 1e-5
+
+    store.forget_learned()
+    assert store.learned_count == 0 and store.is_enrolled
+    assert TemplateStore(path).learned_count == 0              # and it is saved
+    assert TemplateStore(tmp_path / "empty.bin").enrolled_score(owner) == -1.0
+
+
 def test_clear_and_remove(tmp_path):
     path = tmp_path / "t.bin"
     store = TemplateStore(path)
@@ -254,6 +270,22 @@ def test_protected_location_check(monkeypatch):
     assert not in_protected_location(r"C:\Program Files")                           # the folder itself
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows paths")
+def test_protected_location_accepts_short_names(monkeypatch):
+    """The compiled build sees its code as C:\\PROGRA~1\\FaceGate\\... (Nuitka uses 8.3 names)."""
+    import ctypes
+
+    from facegate.win.system import in_protected_location
+
+    monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+    buf = ctypes.create_unicode_buffer(1024)
+    ctypes.windll.kernel32.GetShortPathNameW(r"C:\Program Files", buf, len(buf))
+    if buf.value.lower() == r"c:\program files":
+        pytest.skip("8.3 short names are turned off on drive C:")
+    assert in_protected_location(buf.value + r"\FaceGate\facegate\win\system.py")   # tail need not exist
+    assert not in_protected_location(buf.value)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 def test_environment_overrides_are_ignored_when_elevated(monkeypatch, tmp_path):
     from facegate import config
@@ -270,6 +302,34 @@ def test_environment_overrides_are_ignored_when_elevated(monkeypatch, tmp_path):
     monkeypatch.setattr(native, "is_elevated", lambda: True)
     assert config.data_dir() != tmp_path / "attacker"
     assert all(d != tmp_path / "attacker" for d, _ in native._candidates())
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Task Scheduler")
+def test_autostart_task_also_starts_facegate_again_after_a_crash(monkeypatch):
+    import xml.etree.ElementTree as ET
+
+    from facegate.win import admin
+
+    created: dict[str, str] = {}
+    exe = r"C:\Program Files\FaceGate\FaceGate.exe"
+    monkeypatch.setattr(admin, "app_command", lambda args: (exe, args))
+    monkeypatch.setattr(admin, "elevation_safe", lambda: True)
+    monkeypatch.setattr(admin, "is_compiled", lambda: True)
+    monkeypatch.setattr(admin, "_create_task", lambda name, xml: created.update({name: xml}))
+    assert admin.autostart_on(r"PC\me") == admin.EXIT_OK
+
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    triggers = ET.fromstring(created[admin.TASK_APP].encode("utf-16")).find("t:Triggers", ns)
+    assert triggers.find("t:LogonTrigger", ns) is not None
+    query = ET.fromstring(triggers.find("t:EventTrigger/t:Subscription", ns).text)
+    select = query.find("Query/Select").text
+    assert "'Application Error'" in select and "EventID=1000" in select
+    assert "Data[@Name='AppName']='FaceGate.exe'" in select
+    assert triggers.find("t:EventTrigger/t:Delay", ns).text == "PT10S"
+
+    monkeypatch.setattr(admin, "is_compiled", lambda: False)    # from source the exe is pythonw.exe
+    admin.autostart_on(r"PC\me")
+    assert "EventTrigger" not in created[admin.TASK_APP]
 
 
 # ---- settings ------------------------------------------------------------

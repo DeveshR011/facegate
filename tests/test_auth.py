@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from conftest import make_face, sample, toward
 from facegate.config import Settings
-from facegate.core.auth import (NO_MATCH_FRAMES, POSES, SPOOF_FRAMES, AuthSession, AuthState,
-                                EnrollSession)
+from facegate.core.auth import (ANCHOR, NO_MATCH_FRAMES, POSES, SPOOF_FRAMES, AuthSession,
+                                AuthState, EnrollSession, learn_after_password)
 from facegate.core.occlusion import VIEWS
 from facegate.core.store import TemplateStore
 
@@ -114,28 +114,95 @@ def test_result_is_sticky(engine, frame, tmp_path):
     assert session.feed(frame) is update
 
 
-def test_adaptive_learning_adds_confident_matches_only(engine, frame, tmp_path):
+def look(base, similarity, seed):
+    """A changed look: every view `similarity` away from `base`. (Seeds clear of sample()'s.)"""
+    return {v: toward(base[v], similarity, seed=1000 + 10 * seed + i) for i, v in enumerate(VIEWS)}
+
+
+def test_adaptive_learning_keeps_new_looks_from_everyday_unlocks(engine, frame, tmp_path):
     owner = sample(1)
     store = enrolled_store(tmp_path, owner)
 
-    # a confident but not identical match is learned
-    engine.embedding = {v: toward(owner[v], 0.70, seed=5) for v in VIEWS}
-    assert run(AuthSession(engine, store, Settings()), frame)[0].ok
-    assert store.adaptive["full"].shape[0] == 1
+    # a look the gallery covers only loosely is learned...
+    engine.embedding = look(owner, 0.55, seed=5)
+    session = AuthSession(engine, store, Settings())
+    assert run(session, frame)[0].ok
+    assert store.learned_count == 1 and "learned this look" in session.summary()
 
-    # a borderline match unlocks but is not learned from
-    engine.embedding = {v: toward(owner[v], 0.43, seed=6) for v in VIEWS}
+    # ...one it already covers well adds nothing...
+    engine.embedding = look(owner, 0.90, seed=6)
     assert run(AuthSession(engine, store, Settings()), frame)[0].ok
-    assert store.adaptive["full"].shape[0] == 1
+    assert store.learned_count == 1
 
-    # and never when the option is off
+    # ...and a match that only just clears the threshold unlocks but is not trusted to learn from
+    engine.embedding = look(owner, 0.39, seed=7)
+    assert run(AuthSession(engine, store, Settings()), frame)[0].ok
+    assert store.learned_count == 1
+
+    # never when the option is off
     s = Settings()
     s.adaptive_learning = False
     (tmp_path / "second").mkdir()
     fresh = enrolled_store(tmp_path / "second", owner)
-    engine.embedding = {v: toward(owner[v], 0.70, seed=7) for v in VIEWS}
+    engine.embedding = look(owner, 0.55, seed=8)
     assert run(AuthSession(engine, fresh, s), frame)[0].ok
-    assert fresh.adaptive["full"].shape[0] == 0
+    assert fresh.learned_count == 0
+
+
+def test_a_sudden_change_is_learned_after_the_password(engine, frame, tmp_path):
+    """Haircut and new glasses: the scan misses, the password proves it was you, and from then
+    on the new look is recognised."""
+    owner = sample(1)
+    store = enrolled_store(tmp_path, owner)
+    engine.embedding = look(owner, 0.30, seed=11)          # resembles you, but below the threshold
+
+    session = AuthSession(engine, store, Settings())
+    update, _ = run(session, frame)
+    assert update.state is AuthState.FAILED
+    assert session.near_misses and store.learned_count == 0     # kept, not yet learned
+    assert "failed" in session.summary() and "best score 0.30" in session.summary()
+
+    assert learn_after_password(store, session.near_misses, Settings()) == 1
+    assert run(AuthSession(engine, store, Settings()), frame)[0].ok
+
+
+def test_near_misses_must_be_live_and_resemble_you(engine, frame, tmp_path):
+    owner = sample(1)
+    store = enrolled_store(tmp_path, owner)
+
+    engine.embedding = sample(2)                            # a stranger
+    session = AuthSession(engine, store, Settings())
+    run(session, frame)
+    assert session.near_misses == [] and engine.liveness_calls == 0
+
+    engine.embedding = look(owner, 0.30, seed=12)           # a photo of a changed look
+    engine.live = 0.20
+    session = AuthSession(engine, store, Settings())
+    run(session, frame)
+    assert session.near_misses == []
+
+    s = Settings()
+    s.adaptive_learning = False                             # and nothing at all when learning is off
+    engine.live = 0.95
+    session = AuthSession(engine, store, s)
+    run(session, frame)
+    assert session.near_misses == []
+    assert learn_after_password(store, [(0.3, look(owner, 0.3, seed=13))], s) == 0
+
+
+def test_learned_looks_stay_anchored_to_enrollment(engine, frame, tmp_path):
+    """A face matched only through a learned sample, no longer like the enrolled one, unlocks
+    but is not learned from: learned looks cannot drift step by step to someone else."""
+    owner = sample(1)
+    store = enrolled_store(tmp_path, owner)
+    learned = look(owner, 0.30, seed=14)
+    store.add_adaptive(learned)
+    drifted = look(learned, 0.60, seed=15)
+    assert store.enrolled_score(drifted) < ANCHOR
+
+    engine.embedding = drifted
+    assert run(AuthSession(engine, store, Settings()), frame)[0].ok
+    assert store.learned_count == 1
 
 
 # ---- enrollment ----------------------------------------------------------

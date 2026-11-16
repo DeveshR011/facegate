@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import time
@@ -157,6 +158,23 @@ def test_protected_app_is_frozen_then_released_on_success(guard_env):
     assert status(third.pid) == psutil.STATUS_RUNNING and len(overlay.titles) == 1
 
 
+def test_errors_that_escape_a_thread_are_logged(monkeypatch, caplog):
+    """The exe has no console: a crash in the watcher thread must leave a trace in the log."""
+    import logging
+    import threading
+
+    from facegate.ui import app as ui_app
+
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)               # restored afterwards
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    ui_app._setup_logging()
+    t = threading.Thread(target=lambda: 1 / 0, name="process-watcher")
+    t.start()
+    t.join()
+    assert any(r.levelno == logging.CRITICAL and "process-watcher" in r.getMessage() and r.exc_info
+               for r in caplog.records)
+
+
 def test_engine_unloads_when_idle_and_loads_again_on_demand(monkeypatch):
     from facegate.core import engine as core_engine
     from facegate.ui.context import AppContext
@@ -249,3 +267,72 @@ def test_shutdown_fails_closed(guard_env):
     assert pump(app, lambda: overlay.active)
     controller.shutdown()
     assert pump(app, lambda: p.poll() is not None)
+
+
+@pytestmark_win
+def test_held_processes_are_recorded_until_released(guard_env):
+    from facegate.config import data_dir
+
+    app, ctx, overlay, controller, launch = guard_env
+    p = launch()
+    assert pump(app, lambda: overlay.active)
+    record = data_dir() / "held.json"
+    assert str(p.pid) in json.loads(record.read_text())
+    overlay.finish(True)
+    assert pump(app, lambda: status(p.pid) == psutil.STATUS_RUNNING)
+    assert not record.exists()
+
+
+@pytestmark_win
+def test_processes_left_frozen_by_a_crash_are_released_at_the_next_start(tmp_path):
+    """FaceGate died while holding two programs: the next one ends the protected app (fail
+    closed) and lets the one held for a locked item go on - Windows refuses it the item."""
+    from facegate.ui.guard_controller import APP, LOCK, HeldRecord
+
+    procs = [subprocess.Popen([VICTIM, "-n", "30", "127.0.0.1"], stdout=subprocess.DEVNULL,
+                              creationflags=subprocess.CREATE_NO_WINDOW) for _ in range(3)]
+    try:
+        for p in procs:
+            psutil.Process(p.pid).suspend()
+        record = HeldRecord(tmp_path / "held.json")
+        record.add(procs[0].pid, APP)
+        record.add(procs[1].pid, LOCK)
+        record.add(procs[2].pid, APP)
+        # procs[2]'s pid now belongs to another process, started at another time
+        reused = json.loads((tmp_path / "held.json").read_text())
+        reused[str(procs[2].pid)][0] -= 3600
+        (tmp_path / "held.json").write_text(json.dumps(reused))
+
+        assert HeldRecord(tmp_path / "held.json").recover() == 2
+        assert procs[0].wait(5) is not None
+        assert status(procs[1].pid) == psutil.STATUS_RUNNING
+        assert status(procs[2].pid) == psutil.STATUS_STOPPED        # not ours: left alone
+        assert not (tmp_path / "held.json").exists()
+        assert HeldRecord(tmp_path / "held.json").recover() == 0    # nothing to do next time
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                psutil.Process(p.pid).resume()
+                p.kill()
+
+
+def test_a_scan_gives_up_on_an_engine_that_will_not_load():
+    """This morning's freeze: the engine hung while loading and the scan waited with no end.
+    Now it stops after `engine_wait_s` and the overlay offers the password."""
+    from facegate.ui.overlay import AuthWorker
+
+    class StuckContext:
+        engine_error = ""
+
+        def wait_engine(self, timeout):
+            time.sleep(timeout)
+            return None
+
+    worker = AuthWorker(StuckContext(), engine_wait_s=0.5)
+    t = time.monotonic()
+    assert worker._wait_engine() is None
+    assert 0.45 < time.monotonic() - t < 2.0
+
+    worker.stop()                                          # and a cancel ends the wait at once
+    t = time.monotonic()
+    assert worker._wait_engine() is None and time.monotonic() - t < 0.1

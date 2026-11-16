@@ -96,8 +96,11 @@ def _system32() -> str:
 
 
 def _icacls(*args: str) -> None:
+    # stdin=DEVNULL: started by Task Scheduler, FaceGate's own standard handles are invalid, and a
+    # child that inherits them fails to start.
     r = subprocess.run([os.path.join(_system32(), "icacls.exe"), *args], capture_output=True,
-                       text=True, errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
+                       stdin=subprocess.DEVNULL, text=True, errors="replace",
+                       creationflags=subprocess.CREATE_NO_WINDOW)
     if r.returncode != 0:
         lines = (r.stdout + r.stderr).strip().splitlines()
         raise LockError(lines[0] if lines else f"icacls failed ({r.returncode})")

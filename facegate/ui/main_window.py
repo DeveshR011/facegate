@@ -171,8 +171,14 @@ class MainWindow(QWidget):
                                     "require_liveness", protect_off=True)
         lay.addWidget(separator())
         self.sw_adapt = self._switch(lay, "Adaptive learning",
-                                     "Learns gradual changes - beard, glasses, hairstyle - from "
-                                     "confident matches.", "adaptive_learning", protect_off=False)
+                                     "Keeps up as you change - hair, glasses, beard - from everyday "
+                                     "unlocks. When it misses you and your password unlocks instead, "
+                                     "it offers to remember the new look.",
+                                     "adaptive_learning", protect_off=False)
+        lay.addWidget(separator())
+        self.forget_btn = QPushButton("Forget"); self.forget_btn.clicked.connect(self._forget_learned)
+        self.learned_row = Row("Learned looks", "", self.forget_btn)
+        lay.addWidget(self.learned_row)
         root.addWidget(frame)
 
         # ---- appearance ----
@@ -315,6 +321,11 @@ class MainWindow(QWidget):
             else "Enroll once; add alternate appearances for a cap, glasses or a mask.")
         self.test_btn.setEnabled(ready and n > 0)
         self.reset_btn.setEnabled(n > 0)
+        learned = ctx.store.learned_count
+        self.learned_row.set_subtitle(
+            f"{learned} from recent unlocks. Forgetting them keeps your enrolled face." if learned
+            else "Nothing learned yet.")
+        self.forget_btn.setEnabled(learned > 0)
         for sw, attr in ((self.sw_occ, "occlusion_unlock"), (self.sw_live, "require_liveness"),
                          (self.sw_adapt, "adaptive_learning"), (self.sw_guard, "guard_enabled")):
             sw.setChecked(getattr(s, attr), animate=False)
@@ -522,6 +533,10 @@ class MainWindow(QWidget):
         if not self._confirm("Confirm to Reset Face ID"):
             return
         self.ctx.store.clear()
+        self.ctx.changed.emit()
+
+    def _forget_learned(self) -> None:
+        self.ctx.store.forget_learned()
         self.ctx.changed.emit()
 
     # ---- windows actions -------------------------------------------------
